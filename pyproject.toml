@@ -1,0 +1,15 @@
+[project]
+name = "datastraw-smart-roster"
+version = "0.1.0"
+description = "DataStraw smart roster management assessment application."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "ortools>=9.12,<10.0",
+    "psycopg[binary]>=3.2,<4.0",
+    "sqlalchemy>=2.0,<3.0",
+    "uvicorn[standard]>=0.34,<1.0",
+]
+
+[tool.uv]
+package = false

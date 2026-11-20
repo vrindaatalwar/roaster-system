@@ -1,0 +1,352 @@
+DATASTRAW SMART ROSTER MANAGEMENT SYSTEM
+PROJECT REQUIREMENTS AND IMPLEMENTATION PLAN
+
+Document purpose
+This document consolidates the assessment brief and the planning decisions discussed so far. It is the working source of truth for the assessment build. Where the assessment does not provide company policy or operational data, this document now defines a fixed, configurable demo assumption so implementation can proceed. Demo data and defaults are not claims about DataStraw's real policies. If real operational data becomes available, it replaces the corresponding demo values before production use.
+
+1. PROBLEM STATEMENT
+
+DataStraw manages customer experience and operations for multiple direct-to-consumer brands. Employees work across brands and operational processes, and are organized into pods led by pod leads. Different brands and processes operate on different calendars and need different staffing levels.
+
+The operational problem is to create a valid monthly roster that assigns qualified, available employees to required work while respecting process calendars, employee availability, weekly offs, leave, comp-offs, staffing levels, and employee capacity. A change to one person's availability can cause coverage gaps across one or more brands. The system must detect and explain those gaps and help a manager find a feasible replacement or make a considered manual change.
+
+This is a configurable workforce allocation and constraint-based scheduling application, not only a calendar, spreadsheet digitization, or leave approval tool. The important output is a schedule with explainable allocation decisions and reliable coverage validation.
+
+2. ASSESSMENT CONTEXT AND DELIVERABLES
+
+The source assessment sets a four-day submission deadline and estimates approximately 1.5–2 days of focused work. It allows any technology stack and permits deterministic scheduling, optimization algorithms, AI-assisted workflows, or a combination. It says reliable scheduling and clear coverage validation matter more than unnecessary complexity.
+
+Required submission items:
+- Publicly accessible working application with realistic sample data.
+- GitHub repository with source, README, setup steps, and .env.example when applicable.
+- Three-to-five-minute demo video showing roster generation, different brand calendars, conflict detection, and a change after generation.
+- Short approach note explaining architecture and key decisions.
+- Accessible LinkedIn profile.
+- README responses to the eight reasoning questions in the assessment (data model, generation and validation, single- versus multi-resource brands, unavailable sole owner, conflicts and insufficient staffing, automation versus human control, scaling, and next improvements).
+
+3. USERS AND RESPONSIBILITIES
+
+Operations manager:
+- Maintains employees, pods, pod leads, skills, brands, processes, resource eligibility, calendars, staffing requirements, and availability rules.
+- Generates and reviews monthly rosters.
+- Reviews uncovered work and suggested replacements.
+- Makes manual edits, accepts or rejects suggestions, and is the sole role allowed to publish. A roster with mandatory coverage gaps or hard-rule violations remains a draft and cannot be published in v1.
+
+Pod lead:
+- Oversees the members and schedules in their pod.
+- Can view pod schedules and relevant conflicts. Pod leads are read-only in v1; they do not approve, edit, or publish rosters.
+
+Employee:
+- Is represented in the roster with role/skills, primary pod, working pattern, and availability. There is no employee login or self-service portal in v1; managers maintain employee availability.
+
+4. WORK AND ORGANIZATIONAL MODEL
+
+4.1 Work catalog
+The initial catalog contains four configurable process types. The assessment gives these examples, and the system must allow additional process types:
+- Customer Support (CS): respond to customer questions and issues.
+- Abandoned Cart Conversions (ACC): follow up on abandoned carts.
+- Retention: handle retention and repeat-customer activities.
+- Non-Delivery Report management (NDR): follow up on delivery failures or non-delivery reports.
+- Other brand-specific operational processes configured by a manager.
+
+For the demo, each process record has a name, short description, required skill, default effort per coverage slot, and enabled/disabled status. Demo descriptions do not claim to describe DataStraw's actual internal SOPs. Managers may add a process and define these values without code changes.
+
+4.2 Brand/process coverage model
+Each brand may have one or more processes. For every enabled brand/process combination, configure:
+- Operating calendar: selected weekdays, Sunday behavior, and public-holiday behavior.
+- Minimum distinct employees required per operating day.
+- Required skills/qualifications.
+- Estimated effort hours required from each assigned employee on that day.
+- Whether the process can be shared between employees on the same day.
+- Whether the process requires continuous simultaneous presence. This is false for all v1 demo data; see the daily scheduling-unit rule in section 6.
+- Any process-specific notes.
+
+Brand operating calendars and employee working calendars are separate. A process may require Sunday coverage while a particular employee is off on Sunday.
+
+4.3 Employees, roles, skills, and eligibility
+Do not assume that pod membership alone qualifies an employee for work. Track separately:
+- Role/title and skills/qualifications an employee holds.
+- Brand/process eligibility, including primary owner or backup status.
+- Employee availability and capacity.
+- Primary pod membership.
+
+Managers must be able to configure employee-to-brand/process eligibility without code changes. Some employees may cover multiple brands/processes where explicitly permitted. A shared or cross-pod backup must be qualified and marked eligible before the solver can recommend them.
+
+4.4 Pod model
+- Pods are manager-configurable teams containing exactly six members in the initial sample setup. The manager UI may support other pod sizes; six is a seed-data choice, not a system limit.
+- Each pod has a pod lead and can have a specialization or workload-management purpose.
+- Pod composition may mix roles (for example CS, ACC, retention, NDR, and cross-trained coverage). All pods do not need identical role mixes.
+- For the initial model, each employee has one primary pod. Employees may still be eligible for work and backup coverage outside their primary pod if a manager configures that eligibility.
+- Managers can add, remove, and reassign employees to pods through the UI.
+- Moving an employee into a pod does not automatically grant skills or brand/process eligibility.
+- The seed dataset contains 30 employees in five pods of six, each with one pod lead.
+- The seed dataset contains 15 brands: 12 brands (80%) have one dedicated primary owner; 3 brands have two or three primary owners. The other employees are cross-trained backup capacity and may support more than one brand/process when explicitly marked eligible.
+- Include at least one multi-employee brand whose employees handle different processes, one brand whose employees share the same process, one employee eligible for more than one brand, and at least one brand with a no-backup case.
+
+5. FUNCTIONAL REQUIREMENTS
+
+5.1 Monthly roster generation
+- Select a month and generate or prepare a roster for the team.
+- Accept only integer years from the current calendar year through five years ahead and integer months from 1 through 12; reject past years, years beyond that planning horizon, and invalid values with a client error and do not create a roster run.
+- Consider brand/process operating calendars, minimum coverage, employee eligibility, availability, weekly offs, approved leave, approved comp-offs, public holidays, workload capacity, and configured preferences.
+- Produce assignments identifying employee, date, brand, process, and status (working, off, leave, uncovered, or other configured status).
+- Do not silently publish an invalid roster. If all requirements cannot be met, show the best available partial result, identify uncovered requirements, and explain the cause.
+
+5.2 Allocation rationale
+For each assignment or replacement recommendation, show a concise reason based on the actual inputs, such as:
+- Required skill/qualification matches.
+- Employee is eligible for the brand/process as primary or backup.
+- Employee is available and has remaining capacity.
+- Other eligible employees are unavailable or already assigned.
+- Workload/fairness or continuity preference influenced the choice.
+
+The system must distinguish hard constraints from preferences. Required coverage and eligibility take priority over a preferred day off. Do not add generative AI just to explain decisions; deterministic reason templates based on solver/validator results are sufficient.
+
+5.3 Conflict detection and validation
+At minimum, identify:
+- Required brand/process coverage with no available eligible employee.
+- Insufficient staffing for a process/date.
+- Employee assignment during weekly off, approved leave, approved comp-off, or applicable holiday restriction.
+- Conflicting/overlapping assignments or assignments beyond configured capacity.
+- A manual change or employee availability change that creates gaps across affected brands/processes.
+- Violated configured preferences, clearly distinguished from mandatory violations.
+
+Run validation after roster generation and after manual edits. Solver output must not be assumed valid without validation.
+
+5.4 Roster views
+Provide views/filters for:
+- Company-wide monthly roster.
+- Pod and pod lead.
+- Brand, including assigned employees, processes, and daily coverage.
+- Process and daily staffing.
+- Individual employee, including work days, offs, holidays, and approved leave.
+
+5.5 Manual editing and handling changes
+- Managers can edit roster assignments and immediately validate the impact.
+- Demonstrate at least one post-generation change, such as approved leave on a required coverage day.
+- Managers can change a brand/process calendar or minimum coverage after generation. Revalidate affected dates and identify new gaps without manually rebuilding the whole month; allow a targeted replan for affected dates.
+- On an absence, identify affected coverage and produce a ranked list of all qualified, available, capacity-safe backup employees. If there are no candidates, report the uncovered requirement and its blocking reasons.
+- A manager reviews and accepts a replacement or requests a replan.
+- When replanning, preserve all unaffected assignments. Only assignments on the affected employee/date and assignments that must move to restore coverage may change. Show every proposed change before manager confirmation.
+- If no eligible backup exists, state that the slot remains uncovered and explain whether the cause is missing qualification, unavailable staff, capacity, or insufficient total staffing.
+
+5.6 Management/configuration
+Managers must be able to add/edit/remove employees, brands, processes, pods, pod leads, employee skills, employee-brand-process eligibility, working calendars, coverage requirements, and availability records without changing application code.
+
+6. FIXED V1 DEMO RULES AND ASSUMPTIONS
+
+The following values are the exact defaults used to build and evaluate the assessment demo. They are not DataStraw's verified employment policies. All values are stored as configuration where noted. The demo must label them as assumptions.
+
+6.1 Schedule unit and work hours
+- The v1 planning unit is one calendar day. The system creates one employee-process assignment for a date and estimates its workload in hours.
+- The v1 model does not schedule start/end times or guarantee continuous intraday coverage. Coverage means the required number of distinct qualified employees are assigned to that process on that date.
+- One employee may cover more than one process on the same date only when the sum of the configured effort hours for those assignments is no more than that employee's daily capacity.
+- A process coverage slot defaults to 8 effort hours per assigned employee. Shared-work demo processes may use 4 effort hours per employee. Every process/brand may override the default.
+- Each employee has 8 effort hours of capacity per scheduled day. Breaks are not separately modelled in v1.
+- Process demand is not inferred from brand size, sales, call volume, or historical data. It is the manager-configured minimum headcount multiplied by configured effort hours.
+
+6.2 Employee work pattern and capacity
+- Default demo contract: maximum 5 scheduled days and 40 effort hours in each Monday-to-Sunday calendar week; maximum 8 effort hours in one day.
+- At least 2 days in each Monday-to-Sunday week are unscheduled for each employee. The two days need not be consecutive.
+- Employee-level work patterns may override the default only through explicit configuration. The seed dataset uses the five-day/40-hour contract for all employees, with weekly off days staggered across employees so colleagues on the same brand can have different off days.
+- Overtime is not allowed in v1. If requirements cannot be met within the cap, leave the work uncovered and report the reason.
+- The monthly solver uses the selected month's dates. For calendar weeks partially outside that month, it counts only roster assignments inside the selected month; it does not assume work outside the selected month. This is a demo limitation and must be stated in the UI/README.
+- Minimum rest between shifts is out of scope because v1 has daily assignments and no shift times. The system must not claim to validate inter-shift rest or legal working-time compliance.
+
+6.3 Availability and time off
+- An employee is unavailable on their configured weekly-off dates, approved leave dates, approved comp-off dates, and explicit unavailable dates.
+- Pending leave does not block generation. It appears as a warning; the manager may change the selected request's status through the UI before generation or replanning.
+- Sick leave or another post-generation absence is recorded as an approved/unavailable exception for the affected date before replacement recommendations are calculated.
+- Public holidays are entered as dates. Each brand/process rule independently states whether it operates on each holiday.
+
+6.4 Coverage and eligibility
+- Coverage is a minimum number of distinct employees per brand/process/date.
+- An employee can cover a requirement only if they have the required skill and an active brand/process eligibility record marked primary or backup.
+- Pod membership never grants eligibility or skill automatically.
+- Employees may be primary owner for more than one brand if configured. A brand described as having one dedicated employee means one primary owner; it does not prohibit qualified backups from other brands/pods.
+- If multiple processes are assigned to one employee on one date, the workload-hour capacity rule applies. The same employee counts as one distinct person toward each process's daily headcount only when the configured effort hours fit and the process does not require continuous simultaneous presence. Continuous coverage is unsupported in v1.
+- Operating-calendar templates supported in the demo: (a) all seven days including public holidays, (b) all seven days excluding public holidays, and (c) Monday through Saturday excluding public holidays. Managers can configure individual weekdays and holiday behavior beyond these examples.
+
+6.5 Hard rules, preferences, and optimization order
+Hard rules (must never be violated):
+1. Assign only active employees with the required skill and explicit brand/process eligibility.
+2. Do not assign during weekly off, approved leave, approved comp-off, explicit unavailability, or a closed brand/process day.
+3. Do not exceed 8 effort hours per employee per day, 40 effort hours per employee per Monday-Sunday week, or 5 scheduled days per such week.
+4. Meet the configured minimum brand/process daily headcount. Do not exceed a configured maximum when one exists; otherwise, avoid unnecessary overstaffing as a soft objective. Each process must have its own distinct eligible headcount, subject to the daily effort-capacity rule.
+5. Never mark an uncovered requirement as covered.
+
+Optimization priorities, in order:
+1. Maximize the number of required coverage slots assigned without breaking hard rules.
+2. Prefer primary owners over backup employees when both are feasible.
+3. Minimize changes to existing assignments when repairing a published roster.
+4. Balance total assigned effort hours across employees with comparable contracts and eligibility.
+5. Balance Sunday/public-holiday assignments across those comparable employees.
+6. Respect employee preferences where provided.
+
+Items 2-6 are preferences, not reasons to leave feasible required coverage unfilled. If the roster is infeasible, return the best partial result and list unfilled slots. The explanation should identify concrete blockers from input data; do not claim a formal mathematical proof of infeasibility unless the solver result supports it.
+
+6.6 Replacement behavior
+- A replacement must satisfy all hard rules and required skills/eligibility.
+- Rank candidates by: (1) no hard-rule violations, (2) already eligible for the affected brand/process, (3) lowest workload after assignment, (4) primary-owner/backup priority, then (5) fairness and preference score.
+- Present all qualifying candidates in rank order; do not hide candidates based on a display limit.
+- A manager must approve a replacement. The system does not silently change a published roster.
+- On approval, revalidate all brand/process assignments affected by the selected employee and date. Preserve all other assignments unless a manager explicitly requests a full replan.
+
+6.7 Seed data assumptions
+- Five pods, six employees each; each pod has one designated lead who is also an employee.
+- Fifteen fictional brands and four initial processes (CS, ACC, Retention, NDR); each brand enables at least one process.
+- Twelve brands have one primary owner and three have two or three primary owners. Additional employees form explicitly qualified shared backup capacity.
+- Sample working calendars must include all three calendar templates above.
+- Sample coverage must include minimum staffing of one and two employees, separate-process ownership within one brand, a process shared by multiple employees, a cross-pod backup, and a no-qualified-backup conflict.
+- Include a three-person shared-process brand in neutral seed data. During validation, let the manager select one of its eligible employees and a date to check whether the other two can maintain coverage; do not bake a specific employee/date absence into seed data.
+- Sample effort values use 8-hour full-day slots and 4-hour shared-work slots. They are fictional inputs for demonstrating capacity behavior.
+
+Feasibility implication: with the default five-day pattern, a single employee cannot cover a seven-day-per-week daily requirement alone. A single-primary-owner brand can still meet coverage if a qualified backup/shared pool covers the primary owner's off days and leave. Otherwise the correct result is an uncovered slot.
+
+7. SOLVER AND ARCHITECTURE
+
+The v1 implementation uses this stack:
+- Frontend: React with TypeScript.
+- Backend API: Python FastAPI.
+- Database: PostgreSQL with SQLAlchemy persistence.
+- Scheduling: Google OR-Tools CP-SAT called by the backend.
+- The frontend calls the backend API; the API reads/writes PostgreSQL and invokes the solver. There is no separate solver microservice in v1.
+
+Implementation rules:
+- Build the product UI, data model, configuration, validation, and manager workflows for this specific brand/process problem.
+- Use Google OR-Tools CP-SAT as the deterministic constraint optimization solver to allocate eligible employees across required coverage slots.
+- Model coverage requirements, employee eligibility, availability, capacity, and assignment conflicts as constraints. Optimize soft goals such as fair workload, preference satisfaction, continuity, and minimal roster disruption.
+- Treat every brand/process/date or configured time block needing staff as demand. The output should include assignments, unfilled demand, and reasons for violations/gaps.
+- Keep scheduling logic separate from UI and persistence so it can be explained and maintained.
+- Use PostgreSQL as the relational source of truth because entities and assignments are interconnected and require consistency. PostgreSQL is a project decision, not an assessment requirement.
+- Deploy the React frontend and FastAPI backend as one application release, with a managed PostgreSQL database. Keep secrets in environment variables and provide .env.example.
+- Do not add Redis, Elasticsearch, an LLM, or other infrastructure unless a demonstrated need emerges.
+
+8. IMPLEMENTATION STAGES
+
+Delivery priority and gate:
+- Priority 0 — Stages 1–3: solve the core scheduling problem. Do not begin Stage 4 feature expansion until Stage 3 exit criteria pass.
+- Priority 1 — Stages 4–5: complete the remaining explicitly required assessment features. These are required work, not optional enhancements, and must be executed after the core gate passes.
+- Priority 2 — Stage 6+: optional improvements. Start these only after Stages 1–5 are complete and reviewed, and only if time remains.
+- If time becomes constrained, reduce visual polish and optional scope first. Do not skip or weaken core scheduling, validation, the assessment-required views/editing, or the required change demonstration.
+
+STAGE 1 — Core foundation: define inputs and seed realistic data
+Priority: 0 (core gate)
+Purpose: Make the scheduling problem explicit and runnable with the defined v1 defaults.
+Work:
+- Turn the rules in sections 4 and 6 into configurable data structures.
+- Create employees, primary pods and pod leads, roles/skills, brands, processes, employee eligibility, operating calendars, weekly offs, holiday dates, the availability exception model, and coverage requirements. Do not seed a fixed employee/date leave or comp-off scenario; the manager enters those through the UI.
+- Seed at least 30 employees, multiple pods and brands, mostly single-primary brands, multi-employee brands, overlapping/shared process assignments, and cross-trained backups.
+- Seed neutral examples that demonstrate varied weekly offs, separate-process ownership, shared-process coverage, cross-trained backups, and a brand/process with no qualified backup. Do not seed a specific employee as unavailable to stand in for a user-selected absence scenario.
+- Post-generation changes must use manager-selected input: the manager chooses an employee, leave/comp-off/unavailable type, date or date range, and approval status; or selects a brand/process and changes its calendar or minimum coverage. Do not hardcode a particular employee, weekday, date, or brand as the scenario.
+Exit criteria:
+- The data clearly distinguishes pod membership, role/skill, brand/process eligibility, required coverage, and actual roster assignment.
+- Every demo default is labeled; there are no unresolved assumptions required to start implementation.
+- A manager can inspect enough inputs to understand why an assignment is possible or impossible.
+
+STAGE 2 — Core solution: allocate work and generate a monthly roster
+Priority: 0 (core gate)
+Purpose: Solve the central problem statement before building assessment feature expansion or optional polish.
+Work:
+- Implement the constraint model and optimization objective.
+- Generate assignments across the selected month for all seeded brands/processes.
+- Include an employee-by-date roster status (working, weekly off, approved leave/comp-off, or available but unassigned) alongside brand/process coverage assignments.
+- Enforce eligibility, calendars, availability, weekly offs/leave/comp-off, employee capacity, and no conflicting assignments.
+- Prefer satisfying all mandatory coverage; when impossible, return partial coverage rather than silently violating rules.
+- Record generation status and key allocation reasons.
+- Support re-running the solver after an employee availability change or a brand/process calendar/coverage change. Preserve unaffected assignments and constrain the replan to affected dates unless a full-month replan is explicitly requested.
+- Treat approved leave, approved comp-off, and explicit unavailability as blocking inputs; pending leave is a warning and does not block generation. Generate/replan using the current saved inputs, including any manager-entered absence dates.
+Exit criteria:
+- A manager can generate a month roster from configured inputs.
+- Every assignment is traceable to an eligible, available employee and required coverage slot.
+- The system identifies unfilled coverage where there is no feasible assignment.
+
+STAGE 3 — Core gate: independent validation and explainable change handling
+Priority: 0 (core gate)
+Purpose: Prove whether the roster is valid, can explain infeasibility, and can respond to the required basic availability and brand-rule changes. Passing this stage means the core problem statement is solved.
+Work:
+- Build a validator independent from the generator.
+- Compare required versus assigned staff for every required brand/process/date.
+- Detect availability violations, overlaps, capacity violations, and insufficient staffing.
+- Produce human-readable issue explanations and an overall status (valid, valid with warnings, or needs attention).
+- Create a minimal roster screen with a coverage/conflict panel so the core result is visible.
+- Provide a minimal manager control where the manager selects an employee and enters leave/comp-off/unavailability dates and approval status, plus a control to change a brand/process calendar or minimum coverage. After each saved change, identify affected dates, run validation, and show the before/after coverage impact without manually rebuilding the month.
+- For an affected uncovered slot, show eligible backup candidates or an explicit no-candidate explanation. Manager confirmation is required before applying a replacement.
+Exit criteria:
+- Generated roster is independently checked.
+- Valid schedules are clearly distinguished from partial/invalid schedules.
+- Infeasible cases show the affected work and reason instead of hiding the problem.
+- A manager-entered absence affecting one of three eligible employees is evaluated against remaining coverage; the employee and date are chosen in the UI, not fixed in code.
+- A manager-entered approved absence and a changed brand/process requirement can each be applied after generation, produce affected-date validation, and trigger targeted replanning without changing unrelated assignments.
+
+STAGE 4 — Required assessment features: management, pods, views, and editing
+Priority: 1 (required after the core gate)
+Purpose: Complete the assessment's required management and roster interaction features after Stages 1–3 pass.
+Work:
+- Add manager forms for employees, roles/skills, brands, processes, pods, pod leads, eligibility, calendars, and coverage requirements.
+- Allow managers to add/remove/reassign employees in pods. Preserve the distinction between primary pod and work eligibility.
+- Provide company, pod, brand, process, and employee roster views/filters.
+- Add manual roster edits and immediately rerun validation.
+Exit criteria:
+- Required setup changes can be made through the application rather than code.
+- All required roster perspectives are available.
+- Manual edits cannot appear valid without validation feedback.
+
+STAGE 5 — Required assessment completion: change workflow and submission readiness
+Priority: 1 (required after the core gate)
+Purpose: Complete the assessment's end-to-end change demonstration, deployment, documentation, and submission materials. Stage 3 proves the core change logic; Stage 5 completes the full manager workflow and demo.
+Work:
+- Add or approve a leave/comp-off after generation.
+- Identify every affected coverage slot.
+- Rank qualified backup employees using eligibility, availability, capacity, current workload, and minimal schedule disruption.
+- Let the manager accept a recommendation or replan affected assignments.
+- Preserve unaffected assignments and revalidate the result.
+- Show the no-backup/infeasible case with a clear unresolved gap.
+- Prepare deployment, README/approach note, .env.example where applicable, and 3–5 minute demo walkthrough.
+- Prepare the required submission email with the specified subject, application/repository/LinkedIn links, and a two-to-three-sentence approach summary. Sending the email is outside the build and requires explicit user authorization.
+Exit criteria:
+- Demo shows generation, client-specific calendars, conflict detection, one successful replacement, one unresolved/insufficient-staffing explanation, one-of-three availability validation, and a post-generation brand requirement change already supported by Stage 3.
+- Required submission materials are ready and accessible.
+
+STAGE 6+ — Optional reviewed improvement backlog (not part of the initial commitment)
+Priority: 2 (only after Stages 1–5 pass)
+Purpose: Optimize or extend the product only after all core and required assessment work is complete and reviewed.
+Future work candidates, each requiring a separate review and prioritization decision:
+- More detailed shift windows, hourly/demand-based staffing, and effort estimates.
+- Better solver performance, scenario comparison, and soft-weight tuning.
+- More nuanced fairness, skill-level matching, backup pools, and cross-training suggestions.
+- Automatic replan triggers, approval workflows, notifications, and roster publishing.
+- CSV/Excel export and richer reporting.
+- Explainability dashboards or AI-assisted narrative explanations, if they add value beyond deterministic reasons.
+- Load/performance optimization and additional deployment hardening.
+
+No Stage 6+ item should displace reliable scheduling, correct coverage, or conflict clarity. Review each enhancement against assessment value, implementation time, and whether necessary input data exists.
+
+9. DECISIONS FIXED FOR V1 AND LIMITATIONS
+
+There are no unresolved design choices blocking the assessment demo. The defaults in section 6 and stack in section 7 are the exact v1 behavior. The following are deliberate v1 exclusions:
+- No actual company data or real employee schedules are assumed; seed data is fictional.
+- No demand forecasting from sales, call volume, or historical service data.
+- No time-of-day or continuous-coverage guarantee; all coverage is day-level.
+- No legal compliance determination, payroll integration, attendance tracking, or labor-cost optimization.
+- No automatic manager approvals, employee self-service portal, notifications, or auto-publishing.
+- No automatic cross-training or creation of backup qualifications.
+- Pod leads are read-only; the operations manager is the only role that can publish a roster.
+- No use of an LLM to generate roster assignments or determine validity.
+
+These exclusions may be reconsidered only in Stage 6+ after the assessment requirements are complete and the user reviews their value.
+
+10. SUCCESS CRITERIA
+
+The project succeeds when a reviewer can:
+- Understand the configurable business assumptions and sample staffing setup.
+- See that pod, role/skill, brand/process eligibility, and dated assignments are separate concepts.
+- Generate a monthly schedule that satisfies stated coverage where feasible.
+- See why a person was assigned and what constraints/preferences affected the choice.
+- See clear uncovered work when the problem has no feasible solution.
+- Change a brand/process calendar or coverage requirement after generation and see affected dates revalidated without manually rebuilding the month.
+- Record an employee availability change, receive feasible backup options or a clear gap explanation, and revalidate the roster.
+- Inspect the roster by company, pod, brand, process, or employee.
+- Understand the implementation trade-offs from the README and demo.
+
+END OF REQUIREMENTS
