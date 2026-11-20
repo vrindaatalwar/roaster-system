@@ -10,9 +10,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from .models import (
-    ApprovalStatus, AssignmentStatus, AvailabilityType, Brand, BrandProcessRule,
+    ApprovalStatus, AssignmentStatus, AvailabilityType, Brand, BrandPriority, BrandProcessRule,
+    BrandProcessSchedule,
     CoverageRequirement, Employee, EmployeeEligibility, EligibilityType,
-    EmployeeRosterDayStatus, PreferenceType, PublicHoliday, RosterAssignment,
+    EmployeePodMembership, EmployeeRosterDayStatus, PodSchedule, PreferenceType, PublicHoliday, RosterAssignment,
     RosterEmployeeDay, RosterGenerationReport, RosterRun,
 )
 
@@ -24,12 +25,34 @@ class DemandSlot:
     rule: BrandProcessRule
     day: date
     slot_number: int
+    pod_id: int | None = None
+    priority: int = 3
+
+
+def _minutes(value: str) -> int:
+    hour, minute = (int(part) for part in value.split(":"))
+    return hour * 60 + minute
+
+
+def _active_intervals(schedule: PodSchedule) -> list[tuple[int, int]]:
+    start, end = _minutes(schedule.shift_start), _minutes(schedule.shift_end)
+    break_start, break_end = _minutes(schedule.break_start), _minutes(schedule.break_end)
+    return [(start, break_start), (break_end, end)]
+
+
+def _windows_overlap(first: PodSchedule | None, second: PodSchedule | None) -> bool:
+    if first is None or second is None:
+        return False
+    return any(a_start < b_end and b_start < a_end
+               for a_start, a_end in _active_intervals(first)
+               for b_start, b_end in _active_intervals(second))
 
 
 def generate_month(session: Session, year: int, month: int, *,
                    preserve_from_run_id: int | None = None,
                    affected_dates: set[date] | None = None,
-                   forced_assignments: list[tuple[date, int, int]] | None = None) -> dict:
+                   forced_assignments: list[tuple[date, int, int]] | None = None,
+                   commit: bool = True) -> dict:
     current_year = date.today().year
     if not isinstance(year, int) or isinstance(year, bool) or not current_year <= year <= current_year + 5:
         raise ValueError(f"Year must be an integer between {current_year} and {current_year + 5}.")
@@ -49,9 +72,13 @@ def generate_month(session: Session, year: int, month: int, *,
         old_assignments = session.scalars(select(RosterAssignment).where(
             RosterAssignment.roster_run_id == preserve_from_run_id,
         )).all()
+        previous_assignments: dict[tuple[int, date], list[RosterAssignment]] = defaultdict(list)
         for assignment in old_assignments:
+            previous_assignments[(assignment.brand_process_rule_id, assignment.assignment_date)].append(assignment)
             if assignment.assignment_date not in affected_dates:
                 preserved_assignments[(assignment.brand_process_rule_id, assignment.assignment_date)].append(assignment)
+    else:
+        previous_assignments = defaultdict(list)
 
     employees = session.scalars(select(Employee).options(
         selectinload(Employee.skills), selectinload(Employee.work_contract),
@@ -75,6 +102,20 @@ def generate_month(session: Session, year: int, month: int, *,
             if item.active:
                 eligibility[(employee.id, item.brand_process_rule_id)] = item.eligibility_type
 
+    membership_rows = session.scalars(select(EmployeePodMembership)).all()
+    pod_ids_by_employee: dict[int, set[int]] = defaultdict(set)
+    if membership_rows:
+        for membership in membership_rows:
+            pod_ids_by_employee[membership.employee_id].add(membership.pod_id)
+    else:
+        # Existing databases continue to use their single primary-pod setup until
+        # the manager adds cross-pod memberships in the dashboard.
+        pod_ids_by_employee = {employee.id: {employee.primary_pod_id} for employee in employees}
+    schedule_by_pod = {schedule.pod_id: schedule for schedule in session.scalars(select(PodSchedule)).all()}
+    pod_by_rule = {schedule.brand_process_rule_id: schedule.pod_id
+                   for schedule in session.scalars(select(BrandProcessSchedule)).all()}
+    priorities = {item.brand_id: item.priority for item in session.scalars(select(BrandPriority)).all()}
+
     blocked_dates: dict[int, set[date]] = defaultdict(set)
     for employee in employees:
         for item in employee.availability_exceptions:
@@ -96,7 +137,9 @@ def generate_month(session: Session, year: int, month: int, *,
             if day in holidays and not rule.operate_on_public_holidays:
                 continue
             for slot_no in range(coverage.get(day.weekday(), 0)):
-                slots.append(DemandSlot(rule=rule, day=day, slot_number=slot_no))
+                slots.append(DemandSlot(rule=rule, day=day, slot_number=slot_no,
+                                        pod_id=pod_by_rule.get(rule.id),
+                                        priority=priorities.get(rule.brand_id, 3)))
 
     model = cp_model.CpModel()
     assignment_vars: dict[tuple[int, int], cp_model.IntVar] = {}
@@ -109,6 +152,7 @@ def generate_month(session: Session, year: int, month: int, *,
     employee_week_assignments: dict[tuple[int, int, int], list[tuple[cp_model.IntVar, float]]] = defaultdict(list)
     used_by_process_day: dict[tuple[int, date], list[cp_model.IntVar]] = defaultdict(list)
     used_by_process_day_employee: dict[tuple[int, date, int], list[cp_model.IntVar]] = defaultdict(list)
+    employee_shift_assignments: dict[tuple[int, date, int], list[tuple[cp_model.IntVar, float]]] = defaultdict(list)
 
     for slot_index, slot in enumerate(slots):
         slot_indexes_by_rule_day[(slot.rule.id, slot.day)].append(slot_index)
@@ -118,6 +162,8 @@ def generate_month(session: Session, year: int, month: int, *,
                 continue
             if slot.rule.required_skill_id not in skills_by_employee[employee.id]:
                 continue
+            if slot.pod_id is not None and slot.pod_id not in pod_ids_by_employee.get(employee.id, set()):
+                continue
             if slot.day.weekday() in weekly_offs[employee.id] or slot.day in blocked_dates[employee.id]:
                 continue
             candidates.append(employee)
@@ -125,6 +171,8 @@ def generate_month(session: Session, year: int, month: int, *,
             assignment_vars[(slot_index, employee.id)] = variable
             hours = slot.rule.effort_hours_per_employee
             employee_day_assignments[(employee.id, slot.day)].append((variable, hours))
+            if slot.pod_id is not None:
+                employee_shift_assignments[(employee.id, slot.day, slot.pod_id)].append((variable, hours))
             iso = slot.day.isocalendar()
             employee_week_assignments[(employee.id, iso.year, iso.week)].append((variable, hours))
             used_by_process_day[(slot.rule.id, slot.day)].append(variable)
@@ -177,6 +225,25 @@ def generate_month(session: Session, year: int, month: int, *,
                         "include that date in the affected dates."
                     )
 
+        # On affected dates, keep existing assignments wherever they still satisfy
+        # the updated inputs. This makes the proposal focus its changes on the
+        # employee absence or brand rule that triggered the replan.
+        employees_by_id = {employee.id: employee for employee in employees}
+        for key, slot_indexes in slot_indexes_by_rule_day.items():
+            if key[1] not in affected_dates:
+                continue
+            old_rows = sorted(
+                previous_assignments.get(key, []),
+                key=lambda row: (row.employee_id is None,
+                                 employees_by_id[row.employee_id].employee_code if row.employee_id in employees_by_id else ""),
+            )
+            for slot_index, old_row in zip(slot_indexes, old_rows):
+                if old_row.employee_id is None or (slot_index, old_row.employee_id) not in assignment_vars:
+                    continue
+                changed = model.new_bool_var(f"changed_affected_s{slot_index}")
+                model.add(changed + assignment_vars[(slot_index, old_row.employee_id)] == 1)
+                disruption_penalty_terms.append(changed)
+
     for day, rule_id, employee_id in forced_assignments or []:
         indexes = slot_indexes_by_rule_day.get((rule_id, day), [])
         if affected_dates is None or day not in affected_dates:
@@ -197,11 +264,35 @@ def generate_month(session: Session, year: int, month: int, *,
         if not rule.can_share_same_day:
             model.add(sum(variables) <= 1)
 
+    shifted_day_keys = {(employee_id, day) for employee_id, day, _ in employee_shift_assignments}
     for (employee_id, day), entries in employee_day_assignments.items():
         contract = contracts[employee_id]
+        has_shifted_work = (employee_id, day) in shifted_day_keys
+        daily_capacity = min(contract.daily_capacity_hours, 6.0) if has_shifted_work else contract.daily_capacity_hours
         model.add(sum(int(round(hours * HOUR_SCALE)) * variable for variable, hours in entries)
-                  <= int(round(contract.daily_capacity_hours * HOUR_SCALE)))
+                  <= int(round(daily_capacity * HOUR_SCALE)))
         model.add(sum(variable for variable, _ in entries) >= employee_day_vars[(employee_id, day)])
+
+    shift_use_vars: dict[tuple[int, date, int], cp_model.IntVar] = {}
+    for (employee_id, day, pod_id), entries in employee_shift_assignments.items():
+        window = schedule_by_pod.get(pod_id)
+        capacity = min(window.allocation_capacity_hours, contracts[employee_id].daily_capacity_hours) if window else 6.0
+        model.add(sum(int(round(hours * HOUR_SCALE)) * variable for variable, hours in entries)
+                  <= int(round(capacity * HOUR_SCALE)))
+        shift_use = model.new_bool_var(f"pod_window_e{employee_id}_{day.isoformat()}_p{pod_id}")
+        shift_use_vars[(employee_id, day, pod_id)] = shift_use
+        for assignment_var, _ in entries:
+            model.add(assignment_var <= shift_use)
+        model.add(shift_use <= sum(variable for variable, _ in entries))
+    shift_keys = list(shift_use_vars)
+    for index, first_key in enumerate(shift_keys):
+        employee_id, day, first_pod_id = first_key
+        first_schedule = schedule_by_pod.get(first_pod_id)
+        for second_key in shift_keys[index + 1:]:
+            second_employee_id, second_day, second_pod_id = second_key
+            if (employee_id == second_employee_id and day == second_day and first_pod_id != second_pod_id
+                    and _windows_overlap(first_schedule, schedule_by_pod.get(second_pod_id))):
+                model.add(shift_use_vars[first_key] + shift_use_vars[second_key] <= 1)
 
     max_sundays = model.new_int_var(0, len(month_dates), "maximum_sunday_assignments")
     max_holidays = model.new_int_var(0, len(month_dates), "maximum_holiday_assignments")
@@ -236,6 +327,9 @@ def generate_month(session: Session, year: int, month: int, *,
 
     # Fill demand first, then prefer primary owners, preserve the existing plan, and balance workload.
     uncovered_count = sum(uncovered_vars.values())
+    deadline_priority_penalty = sum(
+        uncovered_vars[index] * slots[index].priority for index in uncovered_vars
+    )
     backup_penalty = sum(
         variable for (slot_index, employee_id), variable in assignment_vars.items()
         if eligibility[(employee_id, slots[slot_index].rule.id)] == EligibilityType.BACKUP
@@ -249,14 +343,16 @@ def generate_month(session: Session, year: int, month: int, *,
             preference_score_terms.append(variable * 1)
         elif any(p.preference_type == PreferenceType.PREFERRED for p in day_preferences):
             preference_score_terms.append(variable * -1)
-    model.minimize(uncovered_count * 1_000_000_000_000 + backup_penalty * 1_000_000
-                   + sum(disruption_penalty_terms) * 10_000
-                   + max_load * 100 + max_sundays * 10 + max_holidays * 10
+    model.minimize(uncovered_count * 1_000_000_000_000
+                   + deadline_priority_penalty * 1_000_000
+                   + backup_penalty * 1_000
+                   + sum(disruption_penalty_terms) * 100
+                   + max_load * 10 + max_sundays * 2 + max_holidays * 2
                    + sum(preference_score_terms))
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 60.0
-    solver.parameters.num_search_workers = 1
+    solver.parameters.num_search_workers = 8
     solver.parameters.random_seed = 0
     status = solver.solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -275,7 +371,12 @@ def generate_month(session: Session, year: int, month: int, *,
             employee_daily_hours[(selected.id, slot.day)] += slot.rule.effort_hours_per_employee
             kind = eligibility[(selected.id, slot.rule.id)].value
             reason = (f"Required skill {slot.rule.required_skill.code} matches; employee is {kind}-eligible, "
-                      "available on this date, and assigned within daily and weekly capacity.")
+                      "available on this date, and assigned within daily and weekly capacity. "
+                      f"Brand deadline priority is {slot.priority}/5.")
+            window = schedule_by_pod.get(slot.pod_id) if slot.pod_id is not None else None
+            if window is not None:
+                reason += (f" Assigned to {window.shift_name} ({window.shift_start}–{window.shift_end}) "
+                           f"in pod {slot.pod_id}; lunch {window.break_start}–{window.break_end} is excluded.")
             session.add(RosterAssignment(
                 roster_run=run, employee=selected, brand_process=slot.rule,
                 assignment_date=slot.day, effort_hours=slot.rule.effort_hours_per_employee,
@@ -283,7 +384,7 @@ def generate_month(session: Session, year: int, month: int, *,
             ))
         else:
             reason = _uncovered_reason(slot, employees, eligibility, skills_by_employee,
-                                       weekly_offs, blocked_dates)
+                                       weekly_offs, blocked_dates, pod_ids_by_employee, schedule_by_pod)
             session.add(RosterAssignment(
                 roster_run=run, employee=None, brand_process=slot.rule,
                 assignment_date=slot.day, effort_hours=slot.rule.effort_hours_per_employee,
@@ -338,7 +439,10 @@ def generate_month(session: Session, year: int, month: int, *,
         uncovered_slots=uncovered_count_value,
         explanation=explanation,
     ))
-    session.commit()
+    if commit:
+        session.commit()
+    else:
+        session.flush()
     return {
         "roster_run_id": run.id,
         "year": year,
@@ -356,7 +460,7 @@ def generate_month(session: Session, year: int, month: int, *,
 
 
 def _uncovered_reason(slot, employees, eligibility, skills_by_employee,
-                      weekly_offs, blocked_dates) -> str:
+                      weekly_offs, blocked_dates, pod_ids_by_employee=None, schedule_by_pod=None) -> str:
     minimum_staff = next((item.minimum_staff for item in slot.rule.coverage_requirements
                           if item.weekday == slot.day.weekday()), 0)
     if minimum_staff > 1 and not slot.rule.can_share_same_day:
@@ -364,13 +468,20 @@ def _uncovered_reason(slot, employees, eligibility, skills_by_employee,
                 "allow multiple employees to cover it on the same day.")
     eligible = [e for e in employees if (e.id, slot.rule.id) in eligibility]
     qualified = [e for e in eligible if slot.rule.required_skill_id in skills_by_employee[e.id]]
+    if slot.pod_id is not None and pod_ids_by_employee is not None:
+        qualified = [e for e in qualified if slot.pod_id in pod_ids_by_employee.get(e.id, set())]
     available = [e for e in qualified if slot.day.weekday() not in weekly_offs[e.id]
                  and slot.day not in blocked_dates[e.id]]
     if not eligible:
         return "No active employee is explicitly eligible for this brand/process."
     if not qualified:
+        if slot.pod_id is not None:
+            return "No eligible employee with the required specialization is a member of this pod's work window."
         return "Eligible employees do not hold the required skill."
     if not available:
         return "All qualified eligible employees are on weekly off or approved leave/comp-off/unavailability."
+    pod_shift = schedule_by_pod.get(slot.pod_id) if slot.pod_id is not None and schedule_by_pod else None
+    window_reason = f" The {pod_shift.shift_name} window may also overlap another pod window." if pod_shift else ""
     return ("Qualified eligible employees exist, but the combined daily/weekly capacity constraints or "
-            "competing coverage demand prevented this slot from being assigned.")
+            f"competing higher-priority coverage demand prevented this slot from being assigned. "
+            f"Brand deadline priority is {slot.priority}/5.{window_reason}")

@@ -77,6 +77,14 @@ class EmployeeSkill(Base):
     proficiency: Mapped[str] = mapped_column(String(30), default="qualified")
 
 
+class EmployeePodMembership(Base):
+    """An employee may be rostered in more than one operational pod."""
+    __tablename__ = "employee_pod_memberships"
+
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="CASCADE"), primary_key=True)
+    pod_id: Mapped[int] = mapped_column(ForeignKey("pods.id", ondelete="CASCADE"), primary_key=True)
+
+
 class Employee(Base):
     __tablename__ = "employees"
     __table_args__ = (
@@ -115,6 +123,47 @@ class Pod(Base):
 
     members: Mapped[list[Employee]] = relationship(back_populates="primary_pod", foreign_keys="Employee.primary_pod_id")
     lead: Mapped[Employee | None] = relationship(foreign_keys=[lead_employee_id], post_update=True)
+
+
+class PodSchedule(Base):
+    """Configurable shift window and allocatable work capacity for a pod."""
+    __tablename__ = "pod_schedules"
+    __table_args__ = (
+        UniqueConstraint("pod_id"),
+        CheckConstraint("allocation_capacity_hours > 0 AND allocation_capacity_hours <= 8",
+                        name="ck_pod_allocation_capacity"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    pod_id: Mapped[int] = mapped_column(ForeignKey("pods.id", ondelete="CASCADE"), nullable=False)
+    shift_name: Mapped[str] = mapped_column(String(80), default="Work window", nullable=False)
+    shift_start: Mapped[str] = mapped_column(String(5), default="09:00", nullable=False)
+    shift_end: Mapped[str] = mapped_column(String(5), default="18:00", nullable=False)
+    break_start: Mapped[str] = mapped_column(String(5), default="13:00", nullable=False)
+    break_end: Mapped[str] = mapped_column(String(5), default="14:00", nullable=False)
+    allocation_capacity_hours: Mapped[float] = mapped_column(Float, default=6.0, nullable=False)
+
+
+class BrandProcessSchedule(Base):
+    """Maps a brand/process requirement to the pod's shift window."""
+    __tablename__ = "brand_process_schedules"
+
+    brand_process_rule_id: Mapped[int] = mapped_column(
+        ForeignKey("brand_process_rules.id", ondelete="CASCADE"), primary_key=True
+    )
+    pod_id: Mapped[int] = mapped_column(ForeignKey("pods.id", ondelete="RESTRICT"), nullable=False)
+
+
+class BrandPriority(Base):
+    """Manager-set deadline urgency; a soft tie-breaker after total coverage."""
+    __tablename__ = "brand_priorities"
+    __table_args__ = (
+        CheckConstraint("priority BETWEEN 1 AND 5", name="ck_brand_priority_range"),
+    )
+
+    brand_id: Mapped[int] = mapped_column(ForeignKey("brands.id", ondelete="CASCADE"), primary_key=True)
+    priority: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    deadline_note: Mapped[str] = mapped_column(String(200), default="", nullable=False)
 
 
 class Skill(Base):

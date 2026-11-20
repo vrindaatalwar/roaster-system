@@ -9,9 +9,11 @@ from sqlalchemy.orm import Session, selectinload
 
 from .models import (
     ApprovalStatus, AssignmentStatus, AvailabilityType, Brand, BrandProcessRule,
-    Employee, EmployeeEligibility, PreferenceType, PublicHoliday,
+    BrandProcessSchedule, Employee, EmployeeEligibility, EmployeePodMembership,
+    PodSchedule, PreferenceType, PublicHoliday,
     RosterAssignment, RosterRun,
 )
+from .scheduling import _windows_overlap
 
 
 def validate_roster(session: Session, roster_run_id: int) -> dict:
@@ -32,6 +34,16 @@ def validate_roster(session: Session, roster_run_id: int) -> dict:
         selectinload(BrandProcessRule.coverage_requirements),
     ).join(BrandProcessRule.brand).where(Brand.is_active.is_(True))).all()
     rule_by_id = {rule.id: rule for rule in rules}
+    schedule_by_rule = {item.brand_process_rule_id: item.pod_id
+                        for item in session.scalars(select(BrandProcessSchedule)).all()}
+    pod_schedules = {item.pod_id: item for item in session.scalars(select(PodSchedule)).all()}
+    memberships = session.scalars(select(EmployeePodMembership)).all()
+    pod_ids_by_employee: dict[int, set[int]] = defaultdict(set)
+    if memberships:
+        for item in memberships:
+            pod_ids_by_employee[item.employee_id].add(item.pod_id)
+    else:
+        pod_ids_by_employee = {employee.id: {employee.primary_pod_id} for employee in employees}
     holidays = {item.holiday_date for item in session.scalars(select(PublicHoliday)).all()}
     assignments = session.scalars(select(RosterAssignment).where(
         RosterAssignment.roster_run_id == run.id,
@@ -61,8 +73,13 @@ def validate_roster(session: Session, roster_run_id: int) -> dict:
     assigned_by_employee_day: dict[tuple[int, date], list[RosterAssignment]] = defaultdict(list)
     assigned_by_employee_week: dict[tuple[int, int, int], list[RosterAssignment]] = defaultdict(list)
     process_employee_day_counts: Counter[tuple[int, date, int]] = Counter()
+    uncovered_reasons: dict[tuple[int, date], list[str]] = defaultdict(list)
 
     for assignment in assignments:
+        if assignment.status == AssignmentStatus.UNCOVERED:
+            uncovered_reasons[(assignment.brand_process_rule_id, assignment.assignment_date)].append(
+                assignment.explanation
+            )
         if assignment.status != AssignmentStatus.WORKING:
             continue
         if assignment.employee_id is None:
@@ -95,6 +112,12 @@ def validate_roster(session: Session, roster_run_id: int) -> dict:
         if eligibility is None:
             valid_for_coverage = False
             add_issue("error", "not_eligible", "Employee has no active eligibility for this brand/process.",
+                      day=day, employee_id=employee.id, rule_id=rule.id)
+        required_pod_id = schedule_by_rule.get(rule.id)
+        if required_pod_id is not None and required_pod_id not in pod_ids_by_employee.get(employee.id, set()):
+            valid_for_coverage = False
+            add_issue("error", "outside_pod_window",
+                      "Employee is not a member of the pod assigned to this brand/process work window.",
                       day=day, employee_id=employee.id, rule_id=rule.id)
         if rule.required_skill_id not in {skill.id for skill in employee.skills}:
             valid_for_coverage = False
@@ -139,14 +162,27 @@ def validate_roster(session: Session, roster_run_id: int) -> dict:
             required = minimum_by_weekday.get(day.weekday(), 0)
             actual = len(assigned_by_rule_day[(rule.id, day)])
             if actual < required:
+                reasons = list(dict.fromkeys(
+                    reason for reason in uncovered_reasons[(rule.id, day)] if reason
+                ))
+                reason_text = f" Reason: {' '.join(reasons)}" if reasons else ""
                 add_issue("error", "insufficient_coverage",
-                          f"{rule.brand.code} {rule.process.code} has {actual} assigned of {required} required.",
+                          f"{rule.brand.code} {rule.process.code} has {actual} assigned of {required} required."
+                          f"{reason_text}",
                           day=day, rule_id=rule.id, required=required, assigned=actual)
             maximum = maximum_by_weekday.get(day.weekday())
             if maximum is not None and actual > maximum:
                 add_issue("error", "maximum_staff_exceeded",
                           f"{rule.brand.code} {rule.process.code} has {actual} assigned, above its maximum of {maximum}.",
                           day=day, rule_id=rule.id, required=maximum, assigned=actual)
+
+        if not rule.can_share_same_day:
+            for (rule_id, day), rows in assigned_by_rule_day.items():
+                if rule_id == rule.id and len(rows) > 1:
+                    add_issue("error", "same_process_sharing_conflict",
+                              f"{rule.brand.code} {rule.process.code} has {len(rows)} employees assigned on one day, "
+                              "but its rule does not allow same-day sharing.",
+                              day=day, rule_id=rule.id, required=1, assigned=len(rows))
 
     for (rule_id, day, employee_id), count in process_employee_day_counts.items():
         if count > 1:
@@ -157,10 +193,36 @@ def validate_roster(session: Session, roster_run_id: int) -> dict:
     for (employee_id, day), rows in assigned_by_employee_day.items():
         employee = employee_by_id[employee_id]
         hours = sum(row.effort_hours for row in rows)
-        if employee.work_contract and hours > employee.work_contract.daily_capacity_hours:
+        shifted_rows = [row for row in rows if schedule_by_rule.get(row.brand_process_rule_id) is not None]
+        capacity = min(employee.work_contract.daily_capacity_hours, 6.0) if employee.work_contract and shifted_rows else (
+            employee.work_contract.daily_capacity_hours if employee.work_contract else 8.0
+        )
+        if hours > capacity:
             add_issue("error", "daily_capacity_exceeded",
-                      f"Employee has {hours:g} assigned hours, above daily capacity of {employee.work_contract.daily_capacity_hours:g}.",
+                      f"Employee has {hours:g} assigned hours, above daily capacity of {capacity:g}.",
                       day=day, employee_id=employee_id)
+
+        hours_by_pod: dict[int, float] = defaultdict(float)
+        rows_by_pod: dict[int, list[RosterAssignment]] = defaultdict(list)
+        for row in rows:
+            pod_id = schedule_by_rule.get(row.brand_process_rule_id)
+            if pod_id is not None:
+                hours_by_pod[pod_id] += row.effort_hours
+                rows_by_pod[pod_id].append(row)
+        for pod_id, pod_hours in hours_by_pod.items():
+            pod_capacity = pod_schedules.get(pod_id).allocation_capacity_hours if pod_id in pod_schedules else 6.0
+            if pod_hours > pod_capacity:
+                add_issue("error", "pod_window_capacity_exceeded",
+                          f"Employee has {pod_hours:g} assigned hours in a pod window, above its {pod_capacity:g}-hour allocation cap.",
+                          day=day, employee_id=employee_id)
+        pod_ids = list(rows_by_pod)
+        for index, first_pod_id in enumerate(pod_ids):
+            for second_pod_id in pod_ids[index + 1:]:
+                if not _windows_overlap(pod_schedules.get(first_pod_id), pod_schedules.get(second_pod_id)):
+                    continue
+                add_issue("error", "overlapping_pod_windows",
+                          "Employee is assigned to two pod work windows whose active periods overlap.",
+                          day=day, employee_id=employee_id)
 
     for (employee_id, year, week), rows in assigned_by_employee_week.items():
         employee = employee_by_id[employee_id]

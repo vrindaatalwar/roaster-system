@@ -76,10 +76,10 @@ Managers must be able to configure employee-to-brand/process eligibility without
 - Pods are manager-configurable teams containing exactly six members in the initial sample setup. The manager UI may support other pod sizes; six is a seed-data choice, not a system limit.
 - Each pod has a pod lead and can have a specialization or workload-management purpose.
 - Pod composition may mix roles (for example CS, ACC, retention, NDR, and cross-trained coverage). All pods do not need identical role mixes.
-- For the initial model, each employee has one primary pod. Employees may still be eligible for work and backup coverage outside their primary pod if a manager configures that eligibility.
+- Each employee has one primary pod and may also be explicitly added to a second pod for cross-pod coverage. Membership is configurable; it does not grant skills or brand/process eligibility.
 - Managers can add, remove, and reassign employees to pods through the UI.
 - Moving an employee into a pod does not automatically grant skills or brand/process eligibility.
-- The seed dataset contains 30 employees in five pods of six, each with one pod lead.
+- The current demo seed contains 30 employees in two pods, each with one lead. Employees may be members of both pods where configured.
 - The seed dataset contains 15 brands: 12 brands (80%) have one dedicated primary owner; 3 brands have two or three primary owners. The other employees are cross-trained backup capacity and may support more than one brand/process when explicitly marked eligible.
 - Include at least one multi-employee brand whose employees handle different processes, one brand whose employees share the same process, one employee eligible for more than one brand, and at least one brand with a no-backup case.
 
@@ -138,20 +138,20 @@ Managers must be able to add/edit/remove employees, brands, processes, pods, pod
 The following values are the exact defaults used to build and evaluate the assessment demo. They are not DataStraw's verified employment policies. All values are stored as configuration where noted. The demo must label them as assumptions.
 
 6.1 Schedule unit and work hours
-- The v1 planning unit is one calendar day. The system creates one employee-process assignment for a date and estimates its workload in hours.
-- The v1 model does not schedule start/end times or guarantee continuous intraday coverage. Coverage means the required number of distinct qualified employees are assigned to that process on that date.
-- One employee may cover more than one process on the same date only when the sum of the configured effort hours for those assignments is no more than that employee's daily capacity.
-- A process coverage slot defaults to 8 effort hours per assigned employee. Shared-work demo processes may use 4 effort hours per employee. Every process/brand may override the default.
-- Each employee has 8 effort hours of capacity per scheduled day. Breaks are not separately modelled in v1.
+- A roster requirement is dated and assigned to one configured pod work window. The system creates one employee-process assignment for each required headcount slot and records its pod/work window and effort hours.
+- Pod work windows have configurable start/end and lunch-break start/end times. They do not assert continuous intraday coverage within the window; an assignment is a workload block associated with that window.
+- Demo setup uses two pods/work windows. Each default window spans 8 clock hours, includes a 1-hour lunch break, and permits at most 6 effort hours to be allocated to brand/process work per employee. The remaining hour is a buffer for handoffs/administrative work. These are fictional defaults and managers can edit them.
+- One employee may cover more than one process on the same date only when the total allocated effort fits both the employee's daily contract and the applicable pod-window capacity. An employee cannot be assigned to two pod windows whose active work periods overlap.
+- Process effort is configured per brand/process. Seeded effort values are at most 6 hours per person; shared-work demo processes may use 3 hours per person. Every process/brand may override the default.
 - Process demand is not inferred from brand size, sales, call volume, or historical data. It is the manager-configured minimum headcount multiplied by configured effort hours.
 
 6.2 Employee work pattern and capacity
-- Default demo contract: maximum 5 scheduled days and 40 effort hours in each Monday-to-Sunday calendar week; maximum 8 effort hours in one day.
+- Default demo contract: maximum 5 scheduled days and 40 effort hours in each Monday-to-Sunday calendar week; maximum 6 allocated effort hours in one day, further limited by the assigned pod window.
 - At least 2 days in each Monday-to-Sunday week are unscheduled for each employee. The two days need not be consecutive.
 - Employee-level work patterns may override the default only through explicit configuration. The seed dataset uses the five-day/40-hour contract for all employees, with weekly off days staggered across employees so colleagues on the same brand can have different off days.
 - Overtime is not allowed in v1. If requirements cannot be met within the cap, leave the work uncovered and report the reason.
 - The monthly solver uses the selected month's dates. For calendar weeks partially outside that month, it counts only roster assignments inside the selected month; it does not assume work outside the selected month. This is a demo limitation and must be stated in the UI/README.
-- Minimum rest between shifts is out of scope because v1 has daily assignments and no shift times. The system must not claim to validate inter-shift rest or legal working-time compliance.
+- Minimum rest between shifts and exact task start/end times are out of scope. Pod windows are used to filter eligible assignment candidates and prevent overlapping-window double-booking, but the system does not claim to validate legal working-time compliance.
 
 6.3 Availability and time off
 - An employee is unavailable on their configured weekly-off dates, approved leave dates, approved comp-off dates, and explicit unavailable dates.
@@ -166,6 +166,9 @@ The following values are the exact defaults used to build and evaluate the asses
 - Employees may be primary owner for more than one brand if configured. A brand described as having one dedicated employee means one primary owner; it does not prohibit qualified backups from other brands/pods.
 - If multiple processes are assigned to one employee on one date, the workload-hour capacity rule applies. The same employee counts as one distinct person toward each process's daily headcount only when the configured effort hours fit and the process does not require continuous simultaneous presence. Continuous coverage is unsupported in v1.
 - Operating-calendar templates supported in the demo: (a) all seven days including public holidays, (b) all seven days excluding public holidays, and (c) Monday through Saturday excluding public holidays. Managers can configure individual weekdays and holiday behavior beyond these examples.
+- Employees have one primary pod and may have membership in either or both of the two demo pods. Pod membership makes the employee available for work in that pod window; it never grants process skill or brand/process eligibility.
+- Each brand/process requirement is assigned to a pod window. A candidate must be an active member of that pod as well as skilled, explicitly eligible, available, and within capacity.
+- If two pod windows overlap, one employee cannot receive assignments in both windows on the same date. If windows do not overlap, work may span both only when total daily and weekly capacity remains valid.
 
 6.5 Hard rules, preferences, and optimization order
 Hard rules (must never be violated):
@@ -177,11 +180,12 @@ Hard rules (must never be violated):
 
 Optimization priorities, in order:
 1. Maximize the number of required coverage slots assigned without breaking hard rules.
-2. Prefer primary owners over backup employees when both are feasible.
-3. Minimize changes to existing assignments when repairing a published roster.
-4. Balance total assigned effort hours across employees with comparable contracts and eligibility.
-5. Balance Sunday/public-holiday assignments across those comparable employees.
-6. Respect employee preferences where provided.
+2. When the total number of covered slots is tied, prefer coverage for brands with higher manager-set deadline priority (1–5; 5 is most urgent).
+3. Prefer primary owners over backup employees when both are feasible.
+4. Minimize changes to existing assignments when repairing a published roster.
+5. Balance total assigned effort hours across employees with comparable contracts and eligibility.
+6. Balance Sunday/public-holiday assignments across those comparable employees.
+7. Respect employee preferences where provided.
 
 Items 2-6 are preferences, not reasons to leave feasible required coverage unfilled. If the roster is infeasible, return the best partial result and list unfilled slots. The explanation should identify concrete blockers from input data; do not claim a formal mathematical proof of infeasibility unless the solver result supports it.
 
@@ -193,13 +197,14 @@ Items 2-6 are preferences, not reasons to leave feasible required coverage unfil
 - On approval, revalidate all brand/process assignments affected by the selected employee and date. Preserve all other assignments unless a manager explicitly requests a full replan.
 
 6.7 Seed data assumptions
-- Five pods, six employees each; each pod has one designated lead who is also an employee.
+- Two pods/work windows with one designated lead each; employees may be members of both pods.
 - Fifteen fictional brands and four initial processes (CS, ACC, Retention, NDR); each brand enables at least one process.
 - Twelve brands have one primary owner and three have two or three primary owners. Additional employees form explicitly qualified shared backup capacity.
 - Sample working calendars must include all three calendar templates above.
 - Sample coverage must include minimum staffing of one and two employees, separate-process ownership within one brand, a process shared by multiple employees, a cross-pod backup, and a no-qualified-backup conflict.
 - Include a three-person shared-process brand in neutral seed data. During validation, let the manager select one of its eligible employees and a date to check whether the other two can maintain coverage; do not bake a specific employee/date absence into seed data.
-- Sample effort values use 8-hour full-day slots and 4-hour shared-work slots. They are fictional inputs for demonstrating capacity behavior.
+- Sample effort values use 6-hour standard work blocks and 3-hour shared-work blocks. They are fictional inputs for demonstrating capacity behavior.
+- Brand deadline priority is a manager-entered 1–5 rank with an optional deadline note. The rank is a soft tie-breaker only: it cannot override skills, explicit eligibility, availability, capacity, or pod-window overlap rules. Managers update it as actual deadlines change.
 
 Feasibility implication: with the default five-day pattern, a single employee cannot cover a seven-day-per-week daily requirement alone. A single-primary-owner brand can still meet coverage if a qualified backup/shared pool covers the primary owner's off days and leave. Otherwise the correct result is an uncovered slot.
 
@@ -227,7 +232,8 @@ Implementation rules:
 Delivery priority and gate:
 - Priority 0 — Stages 1–3: solve the core scheduling problem. Do not begin Stage 4 feature expansion until Stage 3 exit criteria pass.
 - Priority 1 — Stages 4–5: complete the remaining explicitly required assessment features. These are required work, not optional enhancements, and must be executed after the core gate passes.
-- Priority 2 — Stage 6+: optional improvements. Start these only after Stages 1–5 are complete and reviewed, and only if time remains.
+- Priority 1 — Stage 6: approved time-window, cross-pod, and deadline-priority extension, to be built after the original assessment stages.
+- Priority 2 — Stage 7+: optional improvements. Start these only after Stages 1–6 are complete and reviewed, and only if time remains.
 - If time becomes constrained, reduce visual polish and optional scope first. Do not skip or weaken core scheduling, validation, the assessment-required views/editing, or the required change demonstration.
 
 STAGE 1 — Core foundation: define inputs and seed realistic data
@@ -308,11 +314,28 @@ Exit criteria:
 - Demo shows generation, client-specific calendars, conflict detection, one successful replacement, one unresolved/insufficient-staffing explanation, one-of-three availability validation, and a post-generation brand requirement change already supported by Stage 3.
 - Required submission materials are ready and accessible.
 
-STAGE 6+ — Optional reviewed improvement backlog (not part of the initial commitment)
-Priority: 2 (only after Stages 1–5 pass)
+STAGE 6 — User-requested time-window, cross-pod, and deadline-priority extension
+Priority: 1 (approved after the original assessment scope was cross-checked)
+Purpose: Prevent the manual editor from offering employees who are outside the requirement's work window and prioritize deadline-sensitive demand during resource contention.
+Work:
+- Replace the five-pod demo baseline with two configurable pods/work windows, each with a lead and editable start/end/lunch times and six-hour allocation cap.
+- Allow employee membership in both pods while retaining one primary pod; membership does not imply skill or brand/process eligibility.
+- Allow each brand/process to be mapped to a pod work window and its deadline priority to be set from 1 to 5 with a manager-entered deadline note.
+- Make roster generation and the manual assignment picker use the same candidate rules: pod membership, required skill, explicit eligibility, active status, approved availability, weekly offs, daily/weekly capacity, and overlapping-window conflicts.
+- Enforce overlap/capacity constraints in both CP-SAT and the independent validator. Do not rely on a filtered UI alone.
+- Maximize total feasible coverage first. If total coverage is tied because resources are constrained, favor higher deadline priority; still require correct specialization/skill and eligibility. Recommend idle qualified employees for uncovered higher-priority demand.
+- Show the selected pod/time window, brand priority, assignment reason, and concrete blockers for uncovered demand.
+Exit criteria:
+- Two pods and their leads/windows are configurable, and at least one employee belongs to both.
+- Assignments and the manual employee picker include only the employees who pass all hard candidate rules for that dated work window.
+- Overlapping pod work windows cannot double-book the same employee; lunch time is excluded from active work overlap checks.
+- Higher-priority brand demand wins a true contention tie without reducing the maximum total number of covered slots or violating specialization/eligibility.
+- Tests verify cross-pod membership, leave/capacity filtering, overlap rejection, and priority tie-breaking.
+
+STAGE 7+ — Optional reviewed improvement backlog
+Priority: 2 (only after Stages 1–6 pass)
 Purpose: Optimize or extend the product only after all core and required assessment work is complete and reviewed.
 Future work candidates, each requiring a separate review and prioritization decision:
-- More detailed shift windows, hourly/demand-based staffing, and effort estimates.
 - Better solver performance, scenario comparison, and soft-weight tuning.
 - More nuanced fairness, skill-level matching, backup pools, and cross-training suggestions.
 - Automatic replan triggers, approval workflows, notifications, and roster publishing.
@@ -327,14 +350,14 @@ No Stage 6+ item should displace reliable scheduling, correct coverage, or confl
 There are no unresolved design choices blocking the assessment demo. The defaults in section 6 and stack in section 7 are the exact v1 behavior. The following are deliberate v1 exclusions:
 - No actual company data or real employee schedules are assumed; seed data is fictional.
 - No demand forecasting from sales, call volume, or historical service data.
-- No time-of-day or continuous-coverage guarantee; all coverage is day-level.
+- Time windows identify the work period and prevent cross-pod overlap. The app still does not schedule exact start/end times for each individual task or guarantee continuous intraday coverage.
 - No legal compliance determination, payroll integration, attendance tracking, or labor-cost optimization.
 - No automatic manager approvals, employee self-service portal, notifications, or auto-publishing.
 - No automatic cross-training or creation of backup qualifications.
 - Pod leads are read-only; the operations manager is the only role that can publish a roster.
 - No use of an LLM to generate roster assignments or determine validity.
 
-These exclusions may be reconsidered only in Stage 6+ after the assessment requirements are complete and the user reviews their value.
+These exclusions may be reconsidered only in Stage 7+ after the assessment requirements and Stage 6 extension are complete and the user reviews their value.
 
 10. SUCCESS CRITERIA
 
