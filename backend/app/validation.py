@@ -42,8 +42,8 @@ def validate_roster(session: Session, roster_run_id: int) -> dict:
     if memberships:
         for item in memberships:
             pod_ids_by_employee[item.employee_id].add(item.pod_id)
-    else:
-        pod_ids_by_employee = {employee.id: {employee.primary_pod_id} for employee in employees}
+    for employee in employees:
+        pod_ids_by_employee[employee.id].add(employee.primary_pod_id)
     holidays = {item.holiday_date for item in session.scalars(select(PublicHoliday)).all()}
     assignments = session.scalars(select(RosterAssignment).where(
         RosterAssignment.roster_run_id == run.id,

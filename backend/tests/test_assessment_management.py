@@ -9,15 +9,22 @@ from app.database import Base
 from app.main import (
     AssignmentEditRequest,
     AvailabilityStatusRequest,
+    BrandProcessConfigurationRequest,
     BrandConfigurationRequest,
     EmployeeConfigurationRequest,
     EligibilityChangeRequest,
+    PodConfigurationRequest,
     ProcessConfigurationRequest,
+    create_brand_process_rule,
     change_eligibility,
     create_brand,
     create_employee,
+    create_pod,
+    create_process,
     edit_roster_assignment,
     publish_roster,
+    update_employee,
+    update_pod,
     update_process,
     update_availability_status,
 )
@@ -37,6 +44,7 @@ from app.models import (
     EmployeeWorkContract,
     EligibilityType,
     Pod,
+    PodSchedule,
     Process,
     RosterAssignment,
     RosterEmployeeDay,
@@ -103,6 +111,58 @@ class AssessmentManagementTests(unittest.TestCase):
         self.assertEqual({skill.code for skill in employee.skills}, {"CS"})
         self.assertEqual({off.weekday for off in employee.weekly_offs}, {5, 6})
         self.assertEqual(employee.work_contract.max_hours_per_week, 40)
+
+    def test_manager_can_create_and_edit_pod_lead_and_cross_pod_membership(self):
+        response = create_pod(PodConfigurationRequest(
+            name="Pod B", specialization="Operations", lead_employee_code="EMP002",
+            shift_name="Late Window", shift_start="13:00", shift_end="22:00",
+            break_start="17:00", break_end="18:00", allocation_capacity_hours=6,
+        ), session=self.session)
+        pod_b = self.session.get(Pod, response["pod_id"])
+        self.assertEqual(pod_b.lead.employee_code, "EMP002")
+        self.assertEqual(pod_b.lead.primary_pod_id, pod_b.id)
+
+        update_employee("EMP001", EmployeeConfigurationRequest(
+            employee_code="EMP001", full_name="Employee 1", role_title="Operations Associate",
+            pod_name="Pod A", pod_names=["Pod A", "Pod B"], skills=["CS"],
+            weekly_off_weekdays=[5, 6], daily_capacity_hours=6, max_days_per_week=5,
+            max_hours_per_week=40,
+        ), session=self.session)
+        from app.models import EmployeePodMembership
+        self.assertIsNotNone(self.session.get(EmployeePodMembership, (self.employees[0].id, pod_b.id)))
+
+        update_pod(pod_b.id, PodConfigurationRequest(
+            name="Pod B", specialization="Customer Operations", lead_employee_code="EMP002",
+            shift_name="Late Window", shift_start="13:00", shift_end="22:00",
+            break_start="17:00", break_end="18:00", allocation_capacity_hours=5,
+        ), session=self.session)
+        self.assertEqual(pod_b.specialization, "Customer Operations")
+        schedule = self.session.scalar(select(PodSchedule).where(PodSchedule.pod_id == pod_b.id))
+        self.assertEqual(schedule.allocation_capacity_hours, 5)
+
+    def test_manager_can_create_brand_process_calendar_and_staffing_rule(self):
+        self.session.add(PodSchedule(
+            pod_id=self.pod.id, shift_name="Day", shift_start="09:00", shift_end="18:00",
+            break_start="13:00", break_end="14:00", allocation_capacity_hours=6,
+        ))
+        self.session.commit()
+        create_brand(BrandConfigurationRequest(code="NEWB", name="New Brand"), session=self.session)
+        create_process(ProcessConfigurationRequest(
+            code="NDR", name="Delivery reports", description="Resolve delivery issues",
+            required_skill="NDR", default_effort_hours=3, enabled=True,
+        ), session=self.session)
+        response = create_brand_process_rule(BrandProcessConfigurationRequest(
+            brand_code="NEWB", process_code="NDR", operating_weekdays=[0, 1],
+            operate_on_public_holidays=False, effort_hours_per_employee=3,
+            pod_name="Pod A", can_share_same_day=False,
+            minimum_by_weekday=[1, 1, 0, 0, 0, 0, 0],
+            maximum_by_weekday=[None] * 7,
+        ), session=self.session)
+        rule = self.session.get(BrandProcessRule, response["rule_id"])
+        self.assertEqual(rule.operating_weekdays, [0, 1])
+        self.assertEqual({item.weekday: item.minimum_staff for item in rule.coverage_requirements},
+                         {0: 1, 1: 1, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0})
+        self.assertEqual(rule.process.required_skill.code, "NDR")
 
     def test_existing_availability_request_can_be_approved_and_reports_affected_dates(self):
         request = AvailabilityException(

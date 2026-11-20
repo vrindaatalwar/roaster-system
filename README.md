@@ -1,6 +1,6 @@
 # DataStraw Smart Roster
 
-Stages 1–3 provide the configurable workforce foundation, CP-SAT monthly allocation, independent validation, and manager-approved targeted replanning. Stage 4 adds manager configuration, roster perspectives, and assignment edits. The approved Stage 6 extension adds two configurable pod work windows, cross-pod memberships, window-aware assignment candidates, and deadline priority as a scheduling tie-breaker.
+Stages 1–3 provide the configurable workforce foundation, CP-SAT monthly allocation, independent validation, and manager-approved targeted replanning. Stage 4 provides manager-managed team and work configuration, company/pod/brand/process/employee roster perspectives, daily coverage counts, and validated assignment editing. The approved Stage 6 extension adds two configurable pod work windows, cross-pod memberships, window-aware assignment candidates, and deadline priority as a scheduling tie-breaker.
 
 ## Stack
 
@@ -68,6 +68,18 @@ All seeded names, brands, holidays, rules, priorities, and availability examples
 7. **Doubling the team and brands:** Keep the relational model and solver constraints, but add database migrations, API pagination, role-based access, solver-performance monitoring, and load tests. If solve time grows, benchmark the model and consider decomposing by independent coverage groups while preserving global employee capacity constraints.
 8. **One more week:** Add exact task-time blocks and rest constraints if the business needs intraday coverage validation, then run the expanded model against real historical demand and employee contracts. Replace fictional data with approved operational inputs before production use.
 
+## Tests and guardrails
+
+Run the backend test suite from the project root with:
+
+```sh
+PYTHONPATH=backend python -m unittest discover -s backend/tests -v
+```
+
+The suite checks manager input guardrails and CRUD for employees, pods/leads, brands, processes, and brand/process coverage rules; solver/validator agreement across 50 deterministic small fixtures; partial rosters for infeasible demand; approved/pending/declined availability; public holidays; primary and cross-pod membership; overlapping work windows; deadline-priority tie-breaking; manual edits; and targeted replan preservation. Generation independently validates a proposed roster before committing: uncovered demand may remain in a partial draft, but a hard-rule violation rolls the transaction back.
+
+In the local timing run on 2026-11-21, the 30-employee seeded monthly roster had 421 required slots and solved optimally in 24.129 seconds (417 filled, 4 uncovered). A duplicated 60-employee fixture returned a feasible roster in 60.267 seconds (same coverage totals) at the configured 60-second solver limit; the larger run reached a feasible answer but did not prove optimality. Wall-clock timings depend on the machine and are not a deployment benchmark.
+
 ## Demo walkthrough (3–5 minutes)
 
 1. Generate a monthly roster and show the company view, employee-day statuses, and a brand-specific calendar.
@@ -82,4 +94,4 @@ The source is prepared for a container deployment. The assessment additionally r
 
 ## Project stages
 
-Work is gated by the stages in `requirement.txt`. Stages 1–4 include the data foundation, allocation, validation, manager configuration, roster perspectives, and manual draft edits. Stage 5 covers assessment change workflow and submission readiness; Stage 6 is the approved time-window, cross-pod, and deadline-priority extension. Stage 7+ contains optional work. Public hosting, repository visibility, demo recording, and the submitter's own profile link still require the submitter's accounts and input.
+Work is gated by the stages in `requirement.txt`. Stages 1–4 cover the data foundation, allocation, independent validation, manager configuration, roster perspectives, and validated manual draft edits. Stage 5 covers assessment change workflow and submission readiness; Stage 6 is the approved time-window, cross-pod, and deadline-priority extension. Stage 7+ contains optional work. Public hosting, repository visibility, demo recording, and the submitter's own profile link still require the submitter's accounts and input.

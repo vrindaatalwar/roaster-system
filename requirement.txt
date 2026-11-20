@@ -158,6 +158,7 @@ The following values are the exact defaults used to build and evaluate the asses
 - Pending leave does not block generation. It appears as a warning; the manager may change the selected request's status through the UI before generation or replanning.
 - Sick leave or another post-generation absence is recorded as an approved/unavailable exception for the affected date before replacement recommendations are calculated.
 - Public holidays are entered as dates. Each brand/process rule independently states whether it operates on each holiday.
+- A public holiday that coincides with an employee's weekly off does not automatically create a compensatory day off; the app records schedule availability only and does not apply employment-policy rules.
 
 6.4 Coverage and eligibility
 - Coverage is a minimum number of distinct employees per brand/process/date.

@@ -107,10 +107,10 @@ def generate_month(session: Session, year: int, month: int, *,
     if membership_rows:
         for membership in membership_rows:
             pod_ids_by_employee[membership.employee_id].add(membership.pod_id)
-    else:
-        # Existing databases continue to use their single primary-pod setup until
-        # the manager adds cross-pod memberships in the dashboard.
-        pod_ids_by_employee = {employee.id: {employee.primary_pod_id} for employee in employees}
+    # The primary pod remains a membership even when explicit cross-pod rows
+    # exist for only some employees in a database upgraded from the old schema.
+    for employee in employees:
+        pod_ids_by_employee[employee.id].add(employee.primary_pod_id)
     schedule_by_pod = {schedule.pod_id: schedule for schedule in session.scalars(select(PodSchedule)).all()}
     pod_by_rule = {schedule.brand_process_rule_id: schedule.pod_id
                    for schedule in session.scalars(select(BrandProcessSchedule)).all()}
@@ -440,6 +440,19 @@ def generate_month(session: Session, year: int, month: int, *,
         explanation=explanation,
     ))
     if commit:
+        session.flush()
+        # Do not persist a solver result that violates a hard rule. Uncovered
+        # demand is an allowed partial draft; it is reported separately.
+        from .validation import validate_roster
+        validation = validate_roster(session, run.id)
+        hard_issues = [issue for issue in validation["issues"]
+                       if issue["severity"] == "error" and issue["code"] != "insufficient_coverage"]
+        if hard_issues:
+            session.rollback()
+            raise RuntimeError(
+                "Generated roster failed independent hard-rule validation: "
+                + "; ".join(issue["message"] for issue in hard_issues[:5])
+            )
         session.commit()
     else:
         session.flush()

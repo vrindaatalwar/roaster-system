@@ -274,7 +274,7 @@ def create_schema() -> None:
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "stage": "3 - validation and change handling"}
+    return {"status": "ok", "stage": "4 - management, roster views, and editing"}
 
 
 @app.get("/api/v1/seed-summary")
@@ -307,6 +307,8 @@ def seed_summary(session: Session = Depends(get_session)) -> dict:
     pod_ids_by_employee: dict[int, set[int]] = {}
     for membership in memberships:
         pod_ids_by_employee.setdefault(membership.employee_id, set()).add(membership.pod_id)
+    for employee in employees:
+        pod_ids_by_employee.setdefault(employee.id, set()).add(employee.primary_pod_id)
     priorities = {item.brand_id: item for item in session.scalars(select(BrandPriority)).all()}
     pod_schedules = {item.pod_id: item for item in session.scalars(select(PodSchedule)).all()}
     process_schedules = {item.brand_process_rule_id: item for item in session.scalars(select(BrandProcessSchedule)).all()}
@@ -1132,13 +1134,15 @@ def _assignment_candidates(session: Session, run: RosterRun,
         selectinload(Employee.work_contract), selectinload(Employee.availability_exceptions),
         selectinload(Employee.eligibility),
     ).where(Employee.status == "active").order_by(Employee.employee_code)).all()
+    for employee in employees:
+        membership_by_employee[employee.id].add(employee.primary_pod_id)
     options = []
     for employee in employees:
         eligibility = next((item for item in employee.eligibility
                             if item.active and item.brand_process_rule_id == rule.id), None)
         if eligibility is None or rule.required_skill_id not in {skill.id for skill in employee.skills}:
             continue
-        member_pods = membership_by_employee.get(employee.id) or {employee.primary_pod_id}
+        member_pods = membership_by_employee.get(employee.id, {employee.primary_pod_id})
         if target_pod_id is not None and target_pod_id not in member_pods:
             continue
         if (target.assignment_date.weekday() in {item.weekday for item in employee.weekly_offs}
