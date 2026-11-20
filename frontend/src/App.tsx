@@ -5,6 +5,8 @@ const weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const today = new Date();
 
 type Page = "roster" | "employees" | "brands";
+type Role = "manager" | "pod_lead" | "employee";
+type DemoIdentity = { employee_code: string; full_name: string; is_pod_lead: boolean };
 type AvailabilityException = {
   id: number;
   type: string;
@@ -61,7 +63,7 @@ type Roster = {
   status: string;
   generation: { required_slots: number; filled_slots: number; uncovered_slots: number; result_status: string } | null;
   assignments: Assignment[];
-  employee_days: { date: string; employee_code: string; status: string; assigned_effort_hours: number }[];
+  employee_days: { date: string; employee_code: string; status: string; assigned_effort_hours: number; explanation: string }[];
 };
 type Change = {
   roster_run_id: number;
@@ -109,9 +111,16 @@ function pageFromHash(): Page {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const role = (localStorage.getItem("datastraw-role") as Role | null) ?? "manager";
+  const employeeCode = localStorage.getItem("datastraw-employee-code") ?? "";
   const response = await fetch(`${API}${path}`, {
     ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
+    headers: {
+      "Content-Type": "application/json",
+      "X-App-Role": role,
+      ...(role === "manager" ? {} : { "X-Employee-Code": employeeCode }),
+      ...init?.headers,
+    },
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -123,6 +132,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 function App() {
   const [page, setPage] = useState<Page>(pageFromHash);
+  const [role] = useState<Role>((localStorage.getItem("datastraw-role") as Role | null) ?? "manager");
+  const [actorCode, setActorCode] = useState(localStorage.getItem("datastraw-employee-code") ?? "");
+  const [identities, setIdentities] = useState<DemoIdentity[]>([]);
+  const [identitiesReady, setIdentitiesReady] = useState(false);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [roster, setRoster] = useState<Roster | null>(null);
   const [savedRosters, setSavedRosters] = useState<SavedRoster[]>([]);
@@ -136,6 +149,7 @@ function App() {
   const [podName, setPodName] = useState("");
   const [podSpecialization, setPodSpecialization] = useState("");
   const [podLead, setPodLead] = useState("");
+  const [podMembers, setPodMembers] = useState<string[]>([]);
   const [podEditId, setPodEditId] = useState<number | null>(null);
   const [podShift, setPodShift] = useState({ shift_name: "Day Window", shift_start: "09:00", shift_end: "18:00", break_start: "13:00", break_end: "14:00", allocation_capacity_hours: "6" });
   const [eligibilityEmployee, setEligibilityEmployee] = useState("");
@@ -193,6 +207,22 @@ function App() {
   }, []);
 
   useEffect(() => {
+    request<DemoIdentity[]>("/api/v1/demo-identities").then((options) => {
+      setIdentities(options);
+      setIdentitiesReady(true);
+      if (role !== "manager" && !options.some((item) => item.employee_code === actorCode
+        && (role !== "pod_lead" || item.is_pod_lead))) {
+        const preferred = options.find((item) => role !== "pod_lead" || item.is_pod_lead);
+        if (preferred) {
+          localStorage.setItem("datastraw-employee-code", preferred.employee_code);
+          setActorCode(preferred.employee_code);
+        }
+      }
+    }).catch((reason: Error) => setError(reason.message));
+  }, [role]);
+
+  useEffect(() => {
+    if (role !== "manager" && (!actorCode || !identitiesReady)) return;
     request<Summary>("/api/v1/seed-summary").then((data) => {
       setSummary(data);
       const firstActive = data.employees.find((employee) => employee.status === "active");
@@ -216,7 +246,7 @@ function App() {
         })
         .catch((reason: Error) => setError(reason.message));
     }).catch((reason: Error) => setError(reason.message));
-  }, []);
+  }, [role, actorCode, identitiesReady]);
 
   const rules = useMemo(() => summary?.brands.flatMap((brand) => brand.processes.map((rule) => ({
     ...rule, brand_code: brand.code, brand_name: brand.name,
@@ -260,6 +290,22 @@ function App() {
     setPage(nextPage);
     setNotice("");
     setError("");
+  }
+
+  function changeDemoRole(nextRole: Role) {
+    const current = identities.find((item) => item.employee_code === actorCode);
+    const nextIdentity = nextRole === "manager" ? null
+      : nextRole === "pod_lead"
+        ? (current?.is_pod_lead ? current : identities.find((item) => item.is_pod_lead))
+        : (current ?? identities[0]);
+    localStorage.setItem("datastraw-role", nextRole);
+    if (nextIdentity) localStorage.setItem("datastraw-employee-code", nextIdentity.employee_code);
+    window.location.reload();
+  }
+
+  function changeDemoIdentity(code: string) {
+    localStorage.setItem("datastraw-employee-code", code);
+    window.location.reload();
   }
 
   async function loadRoster(id: number) {
@@ -449,11 +495,12 @@ function App() {
     event.preventDefault();
     await runAction(async () => {
       const body = { name: podName, specialization: podSpecialization, lead_employee_code: podLead || null,
+        member_employee_codes: podMembers,
         ...podShift, allocation_capacity_hours: Number(podShift.allocation_capacity_hours) };
       await request(podEditId ? `/api/v1/pods/${podEditId}` : "/api/v1/pods", {
         method: podEditId ? "PATCH" : "POST", body: JSON.stringify(body),
       });
-      setPodEditId(null); setPodName(""); setPodSpecialization(""); setPodLead("");
+      setPodEditId(null); setPodName(""); setPodSpecialization(""); setPodLead(""); setPodMembers([]);
       await refreshSummary(); setNotice("Pod details saved.");
     });
   }
@@ -681,10 +728,21 @@ function App() {
     brands: { title: "Brands", description: "Review brand processes and update operating calendars and coverage rules." },
   };
 
+  if (role !== "manager") {
+    return <ReadOnlyDashboard role={role} actorCode={actorCode} identities={identities}
+      summary={summary} roster={roster} savedRosters={savedRosters} validation={validation}
+      onRoleChange={changeDemoRole} onIdentityChange={changeDemoIdentity}
+      onLoadRoster={(id) => void loadRoster(id)} />;
+  }
+
   return <main className="page-shell">
     <header className="topbar">
       <div className="brand-lockup"><span className="brand-mark">DS</span><div><strong>DataStraw</strong><small>Smart Roster</small></div></div>
-      <div className="topbar-right"><span className="live-dot" /> Manager workspace <span className="avatar">OM</span></div>
+      <div className="topbar-right role-switcher"><span className="live-dot" /> Demo access
+        <label>View as<select value={role} onChange={(event) => changeDemoRole(event.target.value as Role)}>
+          <option value="manager">Manager</option><option value="pod_lead">Pod lead</option><option value="employee">Employee</option>
+        </select></label>
+      </div>
     </header>
 
     <nav className="dashboard-nav" aria-label="Dashboard pages">
@@ -773,9 +831,9 @@ function App() {
           </section>
 
           <section className="card page-card">
-            <div className="section-heading"><div><span className="step-badge">03</span><div><h2>Pods and pod leads</h2><p>Move employees between teams and manage each pod lead.</p></div></div><button className="text-button" type="button" onClick={() => { setPodEditId(null); setPodName(""); setPodSpecialization(""); setPodLead(""); setPodShift({ shift_name: "Day Window", shift_start: "09:00", shift_end: "18:00", break_start: "13:00", break_end: "14:00", allocation_capacity_hours: "6" }); }}>New pod</button></div>
-            <div className="pod-grid">{(summary?.pods ?? []).map((pod) => <article className="pod-card" key={pod.id}><strong>{pod.name}</strong><span>{pod.specialization}</span><small>Lead: {pod.lead_employee_code ?? "Not assigned"}</small><small>{pod.members.length} member(s): {pod.members.join(", ")}</small><small>{pod.shift ? `${pod.shift.name} · ${pod.shift.start}–${pod.shift.end} · break ${pod.shift.break_start}–${pod.shift.break_end} · ${pod.shift.allocation_capacity_hours}h allocatable` : "No work window configured"}</small><button className="text-button" onClick={() => { setPodEditId(pod.id); setPodName(pod.name); setPodSpecialization(pod.specialization); setPodLead(pod.lead_employee_code ?? ""); setPodShift(pod.shift ? { shift_name: pod.shift.name, shift_start: pod.shift.start, shift_end: pod.shift.end, break_start: pod.shift.break_start, break_end: pod.shift.break_end, allocation_capacity_hours: String(pod.shift.allocation_capacity_hours) } : { shift_name: "Work Window", shift_start: "09:00", shift_end: "18:00", break_start: "13:00", break_end: "14:00", allocation_capacity_hours: "6" }); }}>Edit pod</button><button className="text-button" disabled={busy} onClick={() => void runAction(async () => { await request(`/api/v1/pods/${pod.id}`, { method: "DELETE" }); await refreshSummary(); setNotice("Empty pod removed."); })}>Remove empty pod</button></article>)}</div>
-            <form className="change-form page-form" onSubmit={(event) => void savePod(event)}><div className="field-row"><label>Pod name<input required value={podName} onChange={(event) => setPodName(event.target.value)} /></label><label>Specialization<input value={podSpecialization} onChange={(event) => setPodSpecialization(event.target.value)} /></label></div><label>Pod lead<select value={podLead} onChange={(event) => setPodLead(event.target.value)}><option value="">No lead</option>{(summary?.employees ?? []).filter((employee) => employee.status === "active" && (podEditId === null || employee.pods.includes(summary?.pods.find((pod) => pod.id === podEditId)?.name ?? ""))).map((employee) => <option key={employee.code} value={employee.code}>{employee.code} · {employee.name}</option>)}</select></label><p className="muted form-hint">Work window is 8 clock hours with a lunch break; no more than six hours are allocated to brand work.</p><div className="field-row"><label>Window name<input required value={podShift.shift_name} onChange={(event) => setPodShift({ ...podShift, shift_name: event.target.value })} /></label><label>Allocatable hours<input type="number" min="0.25" max="8" step="0.25" value={podShift.allocation_capacity_hours} onChange={(event) => setPodShift({ ...podShift, allocation_capacity_hours: event.target.value })} /></label></div><div className="field-row"><label>Window starts<input type="time" value={podShift.shift_start} onChange={(event) => setPodShift({ ...podShift, shift_start: event.target.value })} /></label><label>Window ends<input type="time" value={podShift.shift_end} onChange={(event) => setPodShift({ ...podShift, shift_end: event.target.value })} /></label></div><div className="field-row"><label>Lunch starts<input type="time" value={podShift.break_start} onChange={(event) => setPodShift({ ...podShift, break_start: event.target.value })} /></label><label>Lunch ends<input type="time" value={podShift.break_end} onChange={(event) => setPodShift({ ...podShift, break_end: event.target.value })} /></label></div><button className="secondary-button" disabled={busy}>{podEditId ? "Save pod and work window" : "Add pod and work window"}</button></form>
+            <div className="section-heading"><div><span className="step-badge">03</span><div><h2>Pods and pod leads</h2><p>Move employees between teams and manage pod membership and leads.</p></div></div><button className="text-button" type="button" onClick={() => { setPodEditId(null); setPodName(""); setPodSpecialization(""); setPodLead(""); setPodMembers([]); setPodShift({ shift_name: "Day Window", shift_start: "09:00", shift_end: "18:00", break_start: "13:00", break_end: "14:00", allocation_capacity_hours: "6" }); }}>New pod</button></div>
+            <div className="pod-grid">{(summary?.pods ?? []).map((pod) => <article className="pod-card" key={pod.id}><strong>{pod.name}</strong><span>{pod.specialization}</span><small>Lead: {pod.lead_employee_code ?? "Not assigned"}</small><small>{pod.members.length} member(s): {pod.members.join(", ")}</small><small>{pod.shift ? `${pod.shift.name} · ${pod.shift.start}–${pod.shift.end} · break ${pod.shift.break_start}–${pod.shift.break_end} · ${pod.shift.allocation_capacity_hours}h allocatable` : "No work window configured"}</small><button className="text-button" onClick={() => { setPodEditId(pod.id); setPodName(pod.name); setPodSpecialization(pod.specialization); setPodLead(pod.lead_employee_code ?? ""); setPodMembers(pod.members); setPodShift(pod.shift ? { shift_name: pod.shift.name, shift_start: pod.shift.start, shift_end: pod.shift.end, break_start: pod.shift.break_start, break_end: pod.shift.break_end, allocation_capacity_hours: String(pod.shift.allocation_capacity_hours) } : { shift_name: "Work Window", shift_start: "09:00", shift_end: "18:00", break_start: "13:00", break_end: "14:00", allocation_capacity_hours: "6" }); }}>Edit pod</button><button className="text-button" disabled={busy} onClick={() => void runAction(async () => { await request(`/api/v1/pods/${pod.id}`, { method: "DELETE" }); await refreshSummary(); setNotice("Empty pod removed."); })}>Remove empty pod</button></article>)}</div>
+            <form className="change-form page-form" onSubmit={(event) => void savePod(event)}><div className="field-row"><label>Pod name<input required value={podName} onChange={(event) => setPodName(event.target.value)} /></label><label>Specialization<input value={podSpecialization} onChange={(event) => setPodSpecialization(event.target.value)} /></label></div><label>Pod lead<select value={podLead} onChange={(event) => setPodLead(event.target.value)}><option value="">No lead</option>{activeEmployees.filter((employee) => podEditId === null || employee.pods.includes(summary?.pods.find((pod) => pod.id === podEditId)?.name ?? "")).map((employee) => <option key={employee.code} value={employee.code}>{employee.code} · {employee.name}</option>)}</select></label><fieldset className="member-picker"><legend>Members of this pod</legend><p className="muted form-hint">Select one or more people. A person can also belong to another pod; membership alone does not grant work eligibility.</p><div className="member-check-grid">{activeEmployees.map((employee) => <label key={employee.code} className={podMembers.includes(employee.code) ? "selected" : ""}><input type="checkbox" checked={podMembers.includes(employee.code)} onChange={() => setPodMembers((current) => current.includes(employee.code) ? current.filter((code) => code !== employee.code) : [...current, employee.code])} /><span>{employee.code} · {employee.name}{employee.code === podLead ? " · Lead" : ""}</span></label>)}</div></fieldset><p className="muted form-hint">Work window is 8 clock hours with a lunch break; no more than six hours are allocated to brand work.</p><div className="field-row"><label>Window name<input required value={podShift.shift_name} onChange={(event) => setPodShift({ ...podShift, shift_name: event.target.value })} /></label><label>Allocatable hours<input type="number" min="0.25" max="8" step="0.25" value={podShift.allocation_capacity_hours} onChange={(event) => setPodShift({ ...podShift, allocation_capacity_hours: event.target.value })} /></label></div><div className="field-row"><label>Window starts<input type="time" value={podShift.shift_start} onChange={(event) => setPodShift({ ...podShift, shift_start: event.target.value })} /></label><label>Window ends<input type="time" value={podShift.shift_end} onChange={(event) => setPodShift({ ...podShift, shift_end: event.target.value })} /></label></div><div className="field-row"><label>Lunch starts<input type="time" value={podShift.break_start} onChange={(event) => setPodShift({ ...podShift, break_start: event.target.value })} /></label><label>Lunch ends<input type="time" value={podShift.break_end} onChange={(event) => setPodShift({ ...podShift, break_end: event.target.value })} /></label></div><button className="secondary-button" disabled={busy}>{podEditId ? "Save pod and members" : "Add pod and members"}</button></form>
           </section>
 
           <section className="card page-card">
@@ -869,6 +927,100 @@ function App() {
         <div className="footer-note">DataStraw Smart Roster <span>·</span> Time-aware allocation review</div>
       </aside>
     </section>
+  </main>;
+}
+
+function ReadOnlyDashboard(props: {
+  role: Exclude<Role, "manager">;
+  actorCode: string;
+  identities: DemoIdentity[];
+  summary: Summary | null;
+  roster: Roster | null;
+  savedRosters: SavedRoster[];
+  validation: Validation | null;
+  onRoleChange: (role: Role) => void;
+  onIdentityChange: (code: string) => void;
+  onLoadRoster: (id: number) => void;
+}) {
+  const { role, actorCode, identities, summary, roster, savedRosters, validation } = props;
+  const actor = summary?.employees.find((item) => item.code === actorCode) ?? summary?.employees[0];
+  const roleLabel = role === "pod_lead" ? "Pod lead · read only" : "Employee · read only";
+  const eligibleIdentities = identities.filter((item) => role !== "pod_lead" || item.is_pod_lead);
+  const assignments = roster?.assignments ?? [];
+  const employeeDays = roster?.employee_days ?? [];
+  return <main className="page-shell">
+    <header className="topbar">
+      <div className="brand-lockup"><span className="brand-mark">DS</span><div><strong>DataStraw</strong><small>Smart Roster</small></div></div>
+      <div className="role-toolbar">
+        <label>Demo role<select value={role} onChange={(event) => props.onRoleChange(event.target.value as Role)}>
+          <option value="manager">Manager</option><option value="pod_lead">Pod lead</option><option value="employee">Employee</option>
+        </select></label>
+        <label>{role === "pod_lead" ? "Pod lead identity" : "Employee identity"}<select value={actorCode}
+          onChange={(event) => props.onIdentityChange(event.target.value)}>
+          {eligibleIdentities.map((item) => <option key={item.employee_code} value={item.employee_code}>
+            {item.employee_code} · {item.full_name}
+          </option>)}
+        </select></label>
+      </div>
+    </header>
+    <section className="hero dashboard-hero">
+      <div><div className="eyebrow">PERSONAL ROSTER VIEW</div>
+        <h1>{role === "pod_lead" ? "Pod schedule" : "My schedule"}</h1>
+        <p>{roleLabel}{actor ? ` · ${actor.code} ${actor.name}` : ""}</p>
+      </div>
+      <div className="hero-meta"><span className="assumption-tag">READ ONLY</span>
+        <span>{role === "pod_lead" ? "View your pod members, assignments, and related validation issues." : "View your assignments, work days, and recorded availability."}</span>
+      </div>
+    </section>
+    <section className="card readonly-card">
+      <div className="section-heading"><div><span className="step-badge">01</span><div><h2>Roster</h2>
+        <p>Select a saved month to review.</p></div></div>
+        <select aria-label="Saved roster" value={roster?.roster_run_id ?? ""}
+          onChange={(event) => event.target.value && props.onLoadRoster(Number(event.target.value))}>
+          <option value="" disabled>Select a roster</option>
+          {savedRosters.map((item) => <option key={item.roster_run_id} value={item.roster_run_id}>
+            {new Date(item.year, item.month - 1, 1).toLocaleString("en", { month: "long", year: "numeric" })} · #{item.roster_run_id}
+          </option>)}
+        </select>
+      </div>
+      {roster ? <>
+        <div className="readonly-summary">
+          <span>{new Date(roster.year, roster.month - 1, 1).toLocaleString("en", { month: "long", year: "numeric" })}</span>
+          <span className="row-status">{roster.status}</span>
+          {role === "pod_lead" && roster.generation && <span>{roster.generation.filled_slots}/{roster.generation.required_slots} pod assignments covered</span>}
+        </div>
+        <div className="table-wrap page-table readonly-table"><table><thead><tr>
+        <th>Date</th><th>Brand</th><th>Process</th><th>Pod</th><th>Employee</th><th>Status</th><th>Reason</th>
+        </tr></thead><tbody>{assignments.map((item) => <tr key={item.assignment_id}>
+          <td>{item.date}</td><td>{item.brand_code}</td>
+          <td>{item.process_code}</td><td>{item.pod_name ?? "—"}</td><td>{item.employee_code ?? "Uncovered"}</td>
+          <td><span className={`row-status ${item.status}`}>{item.status}</span></td><td className="readonly-reason">{item.explanation}</td>
+        </tr>)}</tbody></table>{assignments.length === 0 && <div className="table-footnote">No assignments are available for this view.</div>}</div>
+        {role === "employee" && <>
+          <div className="section-heading readonly-subheading"><div><span className="step-badge">02</span><div><h2>My work days</h2><p>Scheduled work, weekly offs, and availability status.</p></div></div></div>
+          <div className="table-wrap page-table readonly-table"><table><thead><tr><th>Date</th><th>Status</th><th>Allocated hours</th><th>Details</th></tr></thead>
+            <tbody>{employeeDays.map((item) => <tr key={`${item.date}-${item.employee_code}`}><td>{item.date}</td>
+              <td><span className={`row-status ${item.status}`}>{item.status.replace(/_/g, " ")}</span></td>
+              <td>{item.assigned_effort_hours}h</td><td>{item.explanation}</td></tr>)}</tbody>
+          </table>{employeeDays.length === 0 && <div className="table-footnote">No work-day details are available.</div>}</div>
+          <div className="section-heading readonly-subheading"><div><span className="step-badge">03</span><div><h2>My availability</h2><p>Leave, comp-off, and unavailable dates recorded for you.</p></div></div></div>
+          <div className="table-wrap page-table readonly-table"><table><thead><tr><th>Type</th><th>Approval</th><th>From</th><th>Through</th><th>Note</th></tr></thead>
+            <tbody>{(actor?.availability_exceptions ?? []).map((item) => <tr key={item.id}><td>{item.type.replace(/_/g, " ")}</td>
+              <td>{item.approval_status}</td><td>{item.start_date}</td><td>{item.end_date}</td><td>{item.note || "—"}</td></tr>)}</tbody>
+          </table>{!(actor?.availability_exceptions ?? []).length && <div className="table-footnote">No availability records have been entered.</div>}</div>
+        </>}
+      </> : <div className="readonly-empty">{savedRosters.length ? "Choose a saved roster to continue." : "No roster has been generated yet."}</div>}
+    </section>
+    {validation && <section className="card readonly-card">
+      <div className="section-heading"><div><span className="step-badge">!</span><div><h2>Related conflicts and validation</h2>
+        <p>Issues shown here are limited to your schedule or pod.</p></div></div>
+        <span className={`status-pill ${validation.status}`}>{validation.status.replace(/_/g, " ")}</span>
+      </div>
+      {validation.issues.length ? <div className="issue-list">{validation.issues.map((issue, index) => <div className={`issue-row ${issue.severity === "warning" ? "warning-row" : ""}`} key={`${issue.code}-${index}`}>
+        <span className="issue-icon">{issue.severity === "warning" ? "!" : "×"}</span><div><strong>{issue.date ?? "Roster"} · {issue.brand_code ?? "Schedule"}{issue.process_code ? ` · ${issue.process_code}` : ""}</strong><small>{issue.message}</small></div>
+      </div>)}</div> : <div className="empty-success">No related validation issues.</div>}
+    </section>}
+    <p className="footer-note">Demo role selection is for workflow review. It is not sign-in and does not verify who is using the app.</p>
   </main>;
 }
 

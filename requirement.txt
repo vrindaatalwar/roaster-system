@@ -356,6 +356,7 @@ There are no unresolved design choices blocking the assessment demo. The default
 - No automatic manager approvals, employee self-service portal, notifications, or auto-publishing.
 - No automatic cross-training or creation of backup qualifications.
 - Pod leads are read-only; the operations manager is the only role that can publish a roster.
+- V1 role-based views use a selectable demo role and employee identity without authentication. The API applies role permissions and data scoping for the selected identity, but callers can change the role/employee headers; this is for workflow review only, not secure identity verification. Add trusted authentication before real employee data is used.
 - No use of an LLM to generate roster assignments or determine validity.
 
 These exclusions may be reconsidered only in Stage 7+ after the assessment requirements and Stage 6 extension are complete and the user reviews their value.

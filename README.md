@@ -40,6 +40,12 @@ Requires Python 3.12+, PostgreSQL, and `uv`.
 
 The interactive API docs are at `/docs`. Use `POST /api/v1/rosters/generate` with an integer year from the current year through five years ahead and an integer month from 1 to 12 to generate a draft. The response reports coverage totals and pending-availability warnings. Inspect assignments, uncovered slots, and employee-day statuses at `GET /api/v1/rosters/{roster_run_id}`; independent validation is at `/api/v1/rosters/{roster_run_id}/validation`.
 
+### Role-based views (development mode)
+
+Use the **Demo role** selector in the top bar to preview the Manager, Pod lead, and Employee experiences. Pod leads must choose an employee configured as a pod lead; their view is read-only and scoped to their led pods. Employee views are read-only and scoped to that employee's own schedule and availability. Manager-only configuration, assignment edits, replanning, and publishing are also checked by the API.
+
+This is role-based workflow preview without authentication. The browser sends `X-App-Role` and, for pod leads and employees, `X-Employee-Code`; a caller can change those headers and impersonate another demo role or employee. Do not treat these checks as identity verification or expose this unauthenticated mode as a secure production access control system. Add a trusted sign-in provider before using real employee data.
+
 ### Run the complete app with containers
 
 Copy `.env.example` to `.env`, set a local `POSTGRES_PASSWORD`, then run:
@@ -65,7 +71,7 @@ All seeded names, brands, holidays, rules, priorities, and availability examples
 4. **Unavailable sole owner:** The manager records and approves an absence. The validator identifies affected slots, the candidate list reports qualified employees who still have capacity, and the manager reviews a proposed replan. If no replacement is feasible, the slot stays uncovered with an explanation.
 5. **Conflicts and insufficient staffing:** The solver maximizes filled coverage without violating hard constraints. It can return a partial draft with uncovered slots and concrete blockers. Preferences are soft goals. The UI labels the result as a draft and shows validation before a manager decides what to change.
 6. **Automation and human control:** Allocation, constraint checks, candidate screening, and proposed replanning are automated. A manager controls availability status, configuration, deadline priority, manual assignment changes, and whether to apply a proposed roster. The manual picker uses the same hard candidate rules as generation.
-7. **Doubling the team and brands:** Keep the relational model and solver constraints, but add database migrations, API pagination, role-based access, solver-performance monitoring, and load tests. If solve time grows, benchmark the model and consider decomposing by independent coverage groups while preserving global employee capacity constraints.
+7. **Doubling the team and brands:** Keep the relational model and solver constraints, then add database migrations, API pagination, trusted authentication and role-to-identity binding, solver-performance monitoring, and load tests. The current role views are an unauthenticated development preview, not production security. If solve time grows, benchmark the model and consider decomposing by independent coverage groups while preserving global employee capacity constraints.
 8. **One more week:** Add exact task-time blocks and rest constraints if the business needs intraday coverage validation, then run the expanded model against real historical demand and employee contracts. Replace fictional data with approved operational inputs before production use.
 
 ## Tests and guardrails

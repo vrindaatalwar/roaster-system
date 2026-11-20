@@ -5,13 +5,14 @@ from collections import Counter, defaultdict
 from datetime import date, timedelta
 import os
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field, StrictBool, StrictInt, field_validator, model_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, selectinload
 
-from .database import Base, engine, get_session
+from .database import Base, SessionLocal, engine, get_session
 from .models import (
     ApprovalStatus, AssignmentStatus, AvailabilityException, AvailabilityType, Brand,
     BrandPriority, BrandProcessRule, BrandProcessSchedule, Employee, EmployeeEligibility,
@@ -22,6 +23,7 @@ from .models import (
 )
 from .scheduling import _windows_overlap, generate_month
 from .validation import validate_roster
+from starlette.responses import JSONResponse
 
 
 app = FastAPI(title="DataStraw Smart Roster", version="0.1.0")
@@ -33,8 +35,116 @@ app.add_middleware(
     allow_origins=[origin.strip() for origin in allowed_origins if origin.strip()],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "X-App-Role", "X-Employee-Code"],
 )
+
+
+def openapi_with_demo_role_headers() -> dict:
+    """Make the unauthenticated demo role inputs visible in Swagger UI."""
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(title=app.title, version=app.version, routes=app.routes)
+    for path, operations in schema.get("paths", {}).items():
+        if not path.startswith("/api/v1/") or path == "/api/v1/demo-identities":
+            continue
+        for operation in operations.values():
+            if not isinstance(operation, dict):
+                continue
+            parameters = operation.setdefault("parameters", [])
+            parameters.extend([
+                {"name": "X-App-Role", "in": "header", "required": True,
+                 "description": "Demo role: manager, pod_lead, or employee. This is not authentication.",
+                 "schema": {"type": "string", "enum": ["manager", "pod_lead", "employee"]}},
+                {"name": "X-Employee-Code", "in": "header", "required": False,
+                 "description": "Required for pod_lead and employee roles; ignored for manager.",
+                 "schema": {"type": "string"}},
+            ])
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = openapi_with_demo_role_headers
+
+
+@app.middleware("http")
+async def enforce_demo_role_access(request: Request, call_next):
+    """Apply role permissions using a selectable, unauthenticated demo identity.
+
+    The role and employee headers are intentionally not authentication. They let
+    the UI demonstrate role-specific access until a trusted identity provider is
+    added; callers can currently change these headers themselves.
+    """
+    if (request.method == "OPTIONS" or not request.url.path.startswith("/api/v1/")
+            or request.url.path == "/api/v1/demo-identities"):
+        return await call_next(request)
+
+    role = request.headers.get("X-App-Role", "").strip().lower()
+    if role not in {"manager", "pod_lead", "employee"}:
+        return JSONResponse(status_code=401, content={
+            "detail": "Select a demo role using the X-App-Role header.",
+        })
+
+    request.state.actor_role = role
+    request.state.actor_employee_id = None
+    request.state.actor_employee_code = None
+    request.state.actor_pod_ids = set()
+    request.state.actor_member_ids = set()
+
+    if role != "manager":
+        employee_code = request.headers.get("X-Employee-Code", "").strip()
+        if not employee_code:
+            return JSONResponse(status_code=401, content={
+                "detail": "Select an employee identity using the X-Employee-Code header.",
+            })
+        with SessionLocal() as session:
+            employee = session.scalar(select(Employee).where(
+                Employee.employee_code == employee_code,
+                Employee.status == "active",
+            ))
+            if employee is None:
+                return JSONResponse(status_code=403, content={
+                    "detail": "The selected demo identity is not an active employee.",
+                })
+            if role == "pod_lead" and not employee.is_pod_lead:
+                return JSONResponse(status_code=403, content={
+                    "detail": "Pod lead access requires a configured pod lead identity.",
+                })
+            pod_ids = set(session.scalars(select(Pod.id).where(
+                Pod.lead_employee_id == employee.id,
+            )).all()) if role == "pod_lead" else set()
+            if role == "pod_lead" and not pod_ids:
+                return JSONResponse(status_code=403, content={
+                    "detail": "This employee is not assigned as a lead for an active pod.",
+                })
+            member_ids = {employee.id}
+            if pod_ids:
+                member_ids.update(session.scalars(select(Employee.id).where(
+                    Employee.primary_pod_id.in_(pod_ids),
+                )).all())
+                member_ids.update(session.scalars(select(EmployeePodMembership.employee_id).where(
+                    EmployeePodMembership.pod_id.in_(pod_ids),
+                )).all())
+            request.state.actor_employee_id = employee.id
+            request.state.actor_employee_code = employee.employee_code
+            request.state.actor_pod_ids = pod_ids
+            request.state.actor_member_ids = member_ids
+
+    if role != "manager":
+        path = request.url.path
+        allowed_read = request.method == "GET" and (
+            path == "/api/v1/seed-summary"
+            or path == "/api/v1/rosters"
+            or (path.startswith("/api/v1/rosters/") and (
+                path.count("/") == 4
+                or path.endswith("/validation")
+            ))
+        )
+        if not allowed_read:
+            return JSONResponse(status_code=403, content={
+                "detail": "This action is available to managers only.",
+            })
+
+    return await call_next(request)
 
 
 class GenerateRosterRequest(BaseModel):
@@ -135,6 +245,7 @@ class PodConfigurationRequest(BaseModel):
     name: str = Field(min_length=1, max_length=80, strip_whitespace=True)
     specialization: str = Field(default="", max_length=120)
     lead_employee_code: str | None = None
+    member_employee_codes: list[str] | None = None
     shift_name: str = Field(default="Work window", min_length=1, max_length=80)
     shift_start: str = Field(default="09:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     shift_end: str = Field(default="18:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
@@ -152,6 +263,16 @@ class PodConfigurationRequest(BaseModel):
         if end - start != 900:
             raise ValueError("Demo pod windows must span 8 clock hours; configure lunch and allocation separately.")
         return self
+
+    @field_validator("member_employee_codes")
+    @classmethod
+    def validate_member_codes(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        normalized = [value.strip() for value in values if value.strip()]
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("Pod members must be unique employee codes.")
+        return normalized
 
 
 class BrandConfigurationRequest(BaseModel):
@@ -272,13 +393,23 @@ def create_schema() -> None:
     Base.metadata.create_all(engine)
 
 
+@app.get("/api/v1/demo-identities")
+def demo_identities(session: Session = Depends(get_session)) -> list[dict]:
+    """List selectable demo identities; this endpoint contains no schedule data."""
+    employees = session.scalars(select(Employee).where(
+        Employee.status == "active",
+    ).order_by(Employee.employee_code)).all()
+    return [{"employee_code": item.employee_code, "full_name": item.full_name,
+             "is_pod_lead": item.is_pod_lead} for item in employees]
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "stage": "4 - management, roster views, and editing"}
 
 
 @app.get("/api/v1/seed-summary")
-def seed_summary(session: Session = Depends(get_session)) -> dict:
+def seed_summary(request: Request, session: Session = Depends(get_session)) -> dict:
     """Read-only inventory so the manager can inspect demo inputs."""
     employees = session.scalars(
         select(Employee).options(
@@ -349,7 +480,7 @@ def seed_summary(session: Session = Depends(get_session)) -> dict:
                               "deadline_note": priorities[brand.id].deadline_note if brand.id in priorities else "",
                               "processes": process_details})
 
-    return {
+    result = {
         "demo_data_notice": "All names, calendars, effort, eligibility, and availability are fictional assessment assumptions.",
         "counts": {"employees": len(employees), "pods": len(pods), "brands": len(brands),
                    "processes": len(process_catalog)},
@@ -406,9 +537,81 @@ def seed_summary(session: Session = Depends(get_session)) -> dict:
         "brands": brand_details,
     }
 
+    role = request.state.actor_role
+    if role == "manager":
+        return result
+
+    actor_employee_id = request.state.actor_employee_id
+    actor_employee_code = request.state.actor_employee_code
+    visible_pod_ids = request.state.actor_pod_ids
+    visible_member_ids = request.state.actor_member_ids
+    if role == "employee":
+        visible_employees = [item for item in result["employees"] if item["id"] == actor_employee_id]
+        visible_pods = [item for item in result["pods"]
+                        if actor_employee_code in item["members"] or item["lead_employee_code"] == actor_employee_code]
+        result["employees"] = visible_employees
+        result["pods"] = visible_pods
+        result["brands"] = []
+        result["process_catalog"] = []
+    else:
+        visible_pod_names = {pod_by_id[pod_id].name for pod_id in visible_pod_ids if pod_id in pod_by_id}
+        visible_employees = [item for item in result["employees"] if item["id"] in visible_member_ids]
+        result["employees"] = visible_employees
+        result["pods"] = [item for item in result["pods"] if item["id"] in visible_pod_ids]
+        scoped_brands = []
+        for brand in result["brands"]:
+            scoped_processes = [item for item in brand["processes"] if item["pod_name"] in visible_pod_names]
+            if scoped_processes:
+                for process in scoped_processes:
+                    process["eligible_employees"] = [
+                        eligible for eligible in process["eligible_employees"]
+                        if any(employee["code"] == eligible["employee_code"] for employee in visible_employees)
+                    ]
+                brand["processes"] = scoped_processes
+                scoped_brands.append(brand)
+        result["brands"] = scoped_brands
+        visible_process_codes = {item["code"] for brand in scoped_brands for item in brand["processes"]}
+        result["process_catalog"] = [item for item in result["process_catalog"]
+                                      if item["code"] in visible_process_codes]
+
+    result["counts"] = {
+        "employees": len(result["employees"]), "pods": len(result["pods"]),
+        "brands": len(result["brands"]),
+        "processes": len(result["process_catalog"]),
+    }
+    return result
+
 
 def _find_employee(session: Session, code: str) -> Employee | None:
     return session.scalar(select(Employee).where(Employee.employee_code == code))
+
+
+def _sync_pod_members(session: Session, pod: Pod, employee_codes: list[str],
+                       lead_employee_code: str | None = None) -> None:
+    """Set additional pod memberships while preserving employees' primary pods."""
+    selected_codes = set(employee_codes)
+    if lead_employee_code:
+        selected_codes.add(lead_employee_code)
+    selected = session.scalars(select(Employee).where(
+        Employee.employee_code.in_(selected_codes), Employee.status == "active",
+    )).all() if selected_codes else []
+    found_codes = {employee.employee_code for employee in selected}
+    if found_codes != selected_codes:
+        missing = sorted(selected_codes - found_codes)
+        raise HTTPException(status_code=422, detail=f"Unknown or inactive pod member(s): {', '.join(missing)}.")
+    selected_ids = {employee.id for employee in selected}
+    current_links = session.scalars(select(EmployeePodMembership).where(
+        EmployeePodMembership.pod_id == pod.id,
+    )).all()
+    for link in current_links:
+        employee = session.get(Employee, link.employee_id)
+        if link.employee_id not in selected_ids and employee and employee.primary_pod_id != pod.id:
+            session.delete(link)
+    existing_ids = {link.employee_id for link in current_links}
+    for employee in selected:
+        if employee.id not in existing_ids:
+            session.add(EmployeePodMembership(employee_id=employee.id, pod_id=pod.id))
+    session.flush()
 
 
 @app.post("/api/v1/employees")
@@ -522,6 +725,8 @@ def create_pod(payload: PodConfigurationRequest, session: Session = Depends(get_
             session.add(EmployeePodMembership(employee_id=lead.id, pod_id=pod.id))
         lead.is_pod_lead = True
         pod.lead = lead
+    if payload.member_employee_codes is not None or payload.lead_employee_code:
+        _sync_pod_members(session, pod, payload.member_employee_codes or [], payload.lead_employee_code)
     session.commit()
     return {"pod_id": pod.id, "status": "saved"}
 
@@ -547,6 +752,8 @@ def update_pod(pod_id: int, payload: PodConfigurationRequest,
     schedule.break_start = payload.break_start
     schedule.break_end = payload.break_end
     schedule.allocation_capacity_hours = payload.allocation_capacity_hours
+    if payload.member_employee_codes is not None:
+        _sync_pod_members(session, pod, payload.member_employee_codes, payload.lead_employee_code)
     if payload.lead_employee_code:
         lead = _find_employee(session, payload.lead_employee_code)
         if lead is None:
@@ -1014,7 +1221,7 @@ def generate_roster(payload: GenerateRosterRequest,
 
 
 @app.get("/api/v1/rosters")
-def list_rosters(year: int | None = None, month: int | None = None,
+def list_rosters(request: Request, year: int | None = None, month: int | None = None,
                  session: Session = Depends(get_session)) -> list[dict]:
     if month is not None and not 1 <= month <= 12:
         raise HTTPException(status_code=422, detail="Month must be between 1 and 12.")
@@ -1023,18 +1230,41 @@ def list_rosters(year: int | None = None, month: int | None = None,
         query = query.where(RosterRun.year == year)
     if month is not None:
         query = query.where(RosterRun.month == month)
+    if request.state.actor_role == "employee":
+        query = query.where(RosterRun.status == RosterStatus.PUBLISHED)
     runs = session.scalars(query.order_by(RosterRun.id.desc())).all()
-    return [{"roster_run_id": run.id, "year": run.year, "month": run.month,
-             "status": run.status.value,
-             "result_status": run.generation_report.result_status if run.generation_report else "unknown",
-             "required_slots": run.generation_report.required_slots if run.generation_report else 0,
-             "filled_slots": run.generation_report.filled_slots if run.generation_report else 0,
-             "uncovered_slots": run.generation_report.uncovered_slots if run.generation_report else 0}
-            for run in runs]
+    result = []
+    for run in runs:
+        item = {"roster_run_id": run.id, "year": run.year, "month": run.month,
+                "status": run.status.value,
+                "result_status": run.generation_report.result_status if run.generation_report else "unknown",
+                "required_slots": run.generation_report.required_slots if run.generation_report else 0,
+                "filled_slots": run.generation_report.filled_slots if run.generation_report else 0,
+                "uncovered_slots": run.generation_report.uncovered_slots if run.generation_report else 0}
+        if request.state.actor_role == "employee":
+            item.update({"result_status": "personal_view", "required_slots": 0,
+                         "filled_slots": 0, "uncovered_slots": 0})
+        elif request.state.actor_role == "pod_lead":
+            scoped_assignments = session.scalars(select(RosterAssignment).where(
+                RosterAssignment.roster_run_id == run.id,
+            )).all()
+            pod_by_rule = {row.brand_process_rule_id: row.pod_id
+                           for row in session.scalars(select(BrandProcessSchedule)).all()}
+            scoped_assignments = [row for row in scoped_assignments
+                                  if pod_by_rule.get(row.brand_process_rule_id)
+                                  in request.state.actor_pod_ids]
+            filled = sum(row.status == AssignmentStatus.WORKING for row in scoped_assignments)
+            uncovered = sum(row.status == AssignmentStatus.UNCOVERED for row in scoped_assignments)
+            item.update({"result_status": "partial" if uncovered else "complete",
+                         "required_slots": len(scoped_assignments),
+                         "filled_slots": filled, "uncovered_slots": uncovered})
+        result.append(item)
+    return result
 
 
 @app.get("/api/v1/rosters/{roster_run_id}")
-def roster_detail(roster_run_id: int, session: Session = Depends(get_session)) -> dict:
+def roster_detail(roster_run_id: int, request: Request,
+                  session: Session = Depends(get_session)) -> dict:
     run = session.scalar(select(RosterRun).options(
         selectinload(RosterRun.assignments).selectinload(RosterAssignment.employee),
         selectinload(RosterRun.assignments).selectinload(RosterAssignment.brand_process)
@@ -1046,25 +1276,55 @@ def roster_detail(roster_run_id: int, session: Session = Depends(get_session)) -
     ).where(RosterRun.id == roster_run_id))
     if run is None:
         raise HTTPException(status_code=404, detail="Roster run not found")
+    if request.state.actor_role == "employee" and run.status != RosterStatus.PUBLISHED:
+        raise HTTPException(status_code=404, detail="Published roster not found.")
     report = run.generation_report
     schedules_by_rule = {item.brand_process_rule_id: item.pod_id
                          for item in session.scalars(select(BrandProcessSchedule)).all()}
     pod_by_id = {item.id: item for item in session.scalars(select(Pod)).all()}
     shift_by_pod = {item.pod_id: item for item in session.scalars(select(PodSchedule)).all()}
     priorities_by_brand = {item.brand_id: item.priority for item in session.scalars(select(BrandPriority)).all()}
-    return {
-        "roster_run_id": run.id,
-        "year": run.year,
-        "month": run.month,
-        "status": run.status.value,
-        "generation": None if report is None else {
+    role = request.state.actor_role
+    actor_employee_id = request.state.actor_employee_id
+    visible_member_ids = request.state.actor_member_ids
+    visible_assignments = [item for item in run.assignments if (
+        role == "manager"
+        or (role == "employee" and item.employee_id == actor_employee_id)
+        or (role == "pod_lead" and schedules_by_rule.get(item.brand_process_rule_id)
+            in request.state.actor_pod_ids)
+    )]
+    visible_employee_days = [item for item in run.employee_days if (
+        role == "manager"
+        or (role == "employee" and item.employee_id == actor_employee_id)
+        or (role == "pod_lead" and item.employee_id in visible_member_ids)
+    )]
+    generation = None
+    if report is not None and role == "manager":
+        generation = {
             "result_status": report.result_status,
             "solver_status": report.solver_status,
             "required_slots": report.required_slots,
             "filled_slots": report.filled_slots,
             "uncovered_slots": report.uncovered_slots,
             "explanation": report.explanation,
-        },
+        }
+    elif report is not None and role == "pod_lead":
+        scoped_filled = sum(item.status == AssignmentStatus.WORKING for item in visible_assignments)
+        scoped_uncovered = sum(item.status == AssignmentStatus.UNCOVERED for item in visible_assignments)
+        generation = {
+            "result_status": "partial" if scoped_uncovered else "complete",
+            "solver_status": report.solver_status,
+            "required_slots": len(visible_assignments),
+            "filled_slots": scoped_filled,
+            "uncovered_slots": scoped_uncovered,
+            "explanation": f"This view covers {len(visible_assignments)} required slot(s) in your pod(s).",
+        }
+    return {
+        "roster_run_id": run.id,
+        "year": run.year,
+        "month": run.month,
+        "status": run.status.value,
+        "generation": generation,
         "assignments": [{
             "assignment_id": item.id,
             "date": item.assignment_date.isoformat(),
@@ -1084,10 +1344,11 @@ def roster_detail(roster_run_id: int, session: Session = Depends(get_session)) -
                           "break_end": shift_by_pod[schedules_by_rule[item.brand_process_rule_id]].break_end,
                       }),
             "deadline_priority": priorities_by_brand.get(item.brand_process.brand_id, 3),
-            "available_candidates": _assignment_candidates(session, run, item),
+            "available_candidates": (_assignment_candidates(session, run, item)
+                                      if role == "manager" else []),
             "status": item.status.value,
             "explanation": item.explanation,
-        } for item in sorted(run.assignments, key=lambda row: (
+        } for item in sorted(visible_assignments, key=lambda row: (
             row.assignment_date, row.brand_process.brand.code, row.brand_process.process.code,
         ))],
         "employee_days": [{
@@ -1096,7 +1357,7 @@ def roster_detail(roster_run_id: int, session: Session = Depends(get_session)) -
             "status": item.status.value,
             "assigned_effort_hours": item.assigned_effort_hours,
             "explanation": item.explanation,
-        } for item in sorted(run.employee_days, key=lambda row: (
+        } for item in sorted(visible_employee_days, key=lambda row: (
             row.employee.employee_code, row.schedule_date,
         ))],
     }
@@ -1267,12 +1528,45 @@ def _refresh_employee_day(session: Session, run: RosterRun, employee_id: int, da
 
 
 @app.get("/api/v1/rosters/{roster_run_id}/validation")
-def roster_validation(roster_run_id: int, session: Session = Depends(get_session)) -> dict:
+def roster_validation(roster_run_id: int, request: Request,
+                      session: Session = Depends(get_session)) -> dict:
     """Validate persisted assignments independently against current configuration."""
     try:
-        return validate_roster(session, roster_run_id)
+        result = validate_roster(session, roster_run_id)
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    role = request.state.actor_role
+    if role == "manager":
+        return result
+    if role == "employee":
+        visible_issues = [issue for issue in result["issues"]
+                          if issue.get("employee_code") == request.state.actor_employee_code]
+    else:
+        visible_rules = set(session.execute(
+            select(Brand.code, Process.code)
+            .join(BrandProcessRule, BrandProcessRule.brand_id == Brand.id)
+            .join(Process, BrandProcessRule.process_id == Process.id)
+            .join(BrandProcessSchedule,
+                  BrandProcessSchedule.brand_process_rule_id == BrandProcessRule.id)
+            .where(BrandProcessSchedule.pod_id.in_(request.state.actor_pod_ids))
+        ).all())
+        visible_employee_codes = set(session.scalars(select(Employee.employee_code).where(
+            Employee.id.in_(request.state.actor_member_ids),
+        )).all())
+        visible_issues = [issue for issue in result["issues"] if (
+            issue.get("employee_code") in visible_employee_codes
+            or (issue.get("brand_code"), issue.get("process_code")) in visible_rules
+        )]
+    counts = Counter(issue["severity"] for issue in visible_issues)
+    result.update({
+        "status": "needs_attention" if counts["error"] else
+                  "valid_with_warnings" if counts["warning"] else "valid",
+        "issue_count": len(visible_issues),
+        "error_count": counts["error"],
+        "warning_count": counts["warning"],
+        "issues": visible_issues,
+    })
+    return result
 
 
 @app.post("/api/v1/rosters/{roster_run_id}/publish")
