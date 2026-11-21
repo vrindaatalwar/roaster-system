@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "DataStraw smart roster management assessment application."
 requires-python = ">=3.12"
 dependencies = [
+    "clerk-backend-api>=7.1.1",
     "fastapi>=0.115,<1.0",
     "ortools>=9.12,<10.0",
     "psycopg[binary]>=3.2,<4.0",

@@ -13,15 +13,18 @@ import {
 } from "@tabler/icons-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { SignInButton, SignUpButton, UserButton, useAuth } from "@clerk/react";
 
 const API = import.meta.env.VITE_API_BASE_URL ?? "";
 const weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+let getClerkSessionToken: (() => Promise<string | null>) | null = null;
 const today = new Date();
 const todayDate = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
 
 type Page = "roster" | "daily_assignments" | "employee_calendar" | "employees" | "pods" | "brands";
 type Role = "manager" | "pod_lead" | "employee";
 type DemoIdentity = { employee_code: string; full_name: string; is_pod_lead: boolean };
+type SessionProfile = { role: Role; employee: DemoIdentity | null };
 type AvailabilityException = {
   id: number;
   type: string;
@@ -133,14 +136,12 @@ function pageFromHash(): Page {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const role = (localStorage.getItem("datastraw-role") as Role | null) ?? "manager";
-  const employeeCode = localStorage.getItem("datastraw-employee-code") ?? "";
+  const token = await getClerkSessionToken?.();
   const response = await fetch(`${API}${path}`, {
     ...init,
     headers: {
       "Content-Type": "application/json",
-      "X-App-Role": role,
-      ...(role === "manager" ? {} : { "X-Employee-Code": employeeCode }),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...init?.headers,
     },
   });
@@ -155,10 +156,28 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 function App() {
+  const { isLoaded, isSignedIn } = useAuth();
+  if (!isLoaded) return <main className="grid min-h-screen place-items-center text-sm text-[#6e6e73]">Loading sign-in…</main>;
+  if (!isSignedIn) return <main className="grid min-h-screen place-items-center bg-[#f5f7f8] p-6">
+    <section className="w-full max-w-md rounded-2xl border border-[#e5e5ea] bg-white p-8 text-center shadow-sm">
+      <div className="mx-auto mb-4 grid size-12 place-items-center rounded-xl bg-[#003459] text-sm font-extrabold text-white">DS</div>
+      <h1 className="m-0 text-2xl font-semibold tracking-tight text-[#1d1d1f]">DataStraw Smart Roster</h1>
+      <p className="mt-2 text-sm text-[#6e6e73]">Sign in to continue to your roster workspace.</p>
+      <div className="mt-6 flex justify-center gap-3">
+        <SignInButton mode="modal"><button className="rounded-lg bg-[#003459] px-5 py-2.5 text-sm font-semibold text-white">Sign in</button></SignInButton>
+        <SignUpButton mode="modal"><button className="rounded-lg border border-[#d2d2d7] px-5 py-2.5 text-sm font-semibold text-[#1d1d1f]">Create account</button></SignUpButton>
+      </div>
+    </section>
+  </main>;
+  return <AuthenticatedApp />;
+}
+
+function AuthenticatedApp() {
+  const { getToken } = useAuth();
+  getClerkSessionToken = getToken;
   const [page, setPage] = useState<Page>(pageFromHash);
-  const [role] = useState<Role>((localStorage.getItem("datastraw-role") as Role | null) ?? "manager");
-  const [actorCode, setActorCode] = useState(localStorage.getItem("datastraw-employee-code") ?? "");
-  const [identities, setIdentities] = useState<DemoIdentity[]>([]);
+  const [role, setRole] = useState<Role | null>(null);
+  const [actorCode, setActorCode] = useState("");
   const [identitiesReady, setIdentitiesReady] = useState(false);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [roster, setRoster] = useState<Roster | null>(null);
@@ -270,21 +289,15 @@ function App() {
 
 
   useEffect(() => {
-    request<DemoIdentity[]>("/api/v1/demo-identities").then((options) => {
-      setIdentities(options);
+    request<SessionProfile>("/api/v1/me").then((profile) => {
+      setRole(profile.role);
+      setActorCode(profile.employee?.employee_code ?? "");
       setIdentitiesReady(true);
-      if (role !== "manager" && !options.some((item) => item.employee_code === actorCode
-        && (role !== "pod_lead" || item.is_pod_lead))) {
-        const preferred = options.find((item) => role !== "pod_lead" || item.is_pod_lead);
-        if (preferred) {
-          localStorage.setItem("datastraw-employee-code", preferred.employee_code);
-          setActorCode(preferred.employee_code);
-        }
-      }
     }).catch((reason: Error) => setError(reason.message));
-  }, [role]);
+  }, []);
 
   useEffect(() => {
+    if (!role) return;
     if (role !== "manager" && (!actorCode || !identitiesReady)) return;
     request<Summary>("/api/v1/seed-summary").then((data) => {
       setSummary(data);
@@ -408,22 +421,6 @@ function App() {
     setDateFilter(nextPage === "daily_assignments" ? todayDate : "");
     setNotice("");
     setError("");
-  }
-
-  function changeDemoRole(nextRole: Role) {
-    const current = identities.find((item) => item.employee_code === actorCode);
-    const nextIdentity = nextRole === "manager" ? null
-      : nextRole === "pod_lead"
-        ? (current?.is_pod_lead ? current : identities.find((item) => item.is_pod_lead))
-        : (current ?? identities[0]);
-    localStorage.setItem("datastraw-role", nextRole);
-    if (nextIdentity) localStorage.setItem("datastraw-employee-code", nextIdentity.employee_code);
-    window.location.reload();
-  }
-
-  function changeDemoIdentity(code: string) {
-    localStorage.setItem("datastraw-employee-code", code);
-    window.location.reload();
   }
 
   async function loadRoster(id: number): Promise<Roster> {
@@ -968,10 +965,17 @@ function App() {
     brands: { title: "Brands", description: "Clients and demand rules" },
   };
 
+  if (!role) return <main className="grid min-h-screen place-items-center bg-[#f5f7f8] p-6 text-sm text-[#6e6e73]">
+    <section className="w-full max-w-lg rounded-2xl border border-[#e5e5ea] bg-white p-7 text-center shadow-sm">
+      <div className="mb-4 flex justify-center"><UserButton /></div>
+      <h1 className="m-0 text-xl font-semibold text-[#1d1d1f]">{error ? "Workspace access needs setup" : "Loading your workspace…"}</h1>
+      {error && <p className="mt-2 text-sm">{error}</p>}
+    </section>
+  </main>;
+
   if (role !== "manager") {
-    return <ReadOnlyDashboard role={role} actorCode={actorCode} identities={identities}
+    return <ReadOnlyDashboard role={role} actorCode={actorCode}
       summary={summary} roster={roster} savedRosters={savedRosters} validation={validation}
-      onRoleChange={changeDemoRole} onIdentityChange={changeDemoIdentity}
       onLoadRoster={(id) => void loadRoster(id)} />;
   }
 
@@ -989,10 +993,7 @@ function App() {
         </button>)}
       </nav>
       <div className={cn("mt-auto flex flex-col gap-2 border-t border-[#e5e5ea] px-2 pt-4 max-[760px]:mt-1 max-[760px]:flex-row max-[760px]:items-center max-[760px]:justify-between max-[760px]:gap-3 max-[760px]:px-0 max-[760px]:pt-2.5 [&_label]:text-xs [&_label]:font-semibold [&_label]:text-[#68717c] [&_select]:h-10 [&_select]:w-full [&_select]:rounded-[9px] [&_select]:border [&_select]:border-[#d2d2d7] [&_select]:bg-white [&_select]:px-3 [&_select]:text-[13px] [&_select]:font-medium [&_select]:text-[#003459] [&_select]:outline-none [&_select]:focus-visible:outline-2 [&_select]:focus-visible:outline-offset-2 [&_select]:focus-visible:outline-[#7d8cc4] [&_select]:max-[760px]:h-9 [&_select]:max-[760px]:w-[min(220px,65%)]")}>
-        <label htmlFor="manager-role-select">View as</label>
-        <select id="manager-role-select" value={role} onChange={(event) => changeDemoRole(event.target.value as Role)}>
-          <option value="manager">Manager</option><option value="pod_lead">Pod lead</option><option value="employee">Employee</option>
-        </select>
+        <div className="flex items-center gap-3"><span className="text-xs text-[#6e6e73]">Account</span><UserButton /></div>
       </div>
     </aside>
     <div className={cn("min-w-0")}>
@@ -1219,35 +1220,21 @@ function App() {
 function ReadOnlyDashboard(props: {
   role: Exclude<Role, "manager">;
   actorCode: string;
-  identities: DemoIdentity[];
   summary: Summary | null;
   roster: Roster | null;
   savedRosters: SavedRoster[];
   validation: Validation | null;
-  onRoleChange: (role: Role) => void;
-  onIdentityChange: (code: string) => void;
   onLoadRoster: (id: number) => void;
 }) {
-  const { role, actorCode, identities, summary, roster, savedRosters, validation } = props;
+  const { role, actorCode, summary, roster, savedRosters, validation } = props;
   const actor = summary?.employees.find((item) => item.code === actorCode) ?? summary?.employees[0];
   const roleLabel = role === "pod_lead" ? "Pod lead · read only" : "Employee · read only";
-  const eligibleIdentities = identities.filter((item) => role !== "pod_lead" || item.is_pod_lead);
   const assignments = roster?.assignments ?? [];
   const employeeDays = roster?.employee_days ?? [];
   return <main className={cn("mx-auto w-full min-w-0 max-w-[1600px] overflow-x-hidden px-[34px] pb-14 pt-[30px] max-[760px]:px-[18px] max-[760px]:pb-9 max-[760px]:pt-[22px]")}>
     <header className={cn("flex h-[72px] items-center justify-between border-b border-[#e5e5ea]")}>
       <div className={cn("flex items-center gap-2.5 px-2 pb-7 max-[760px]:px-0 max-[760px]:pb-2")}><span className={cn("grid size-[34px] shrink-0 place-items-center rounded-[10px] bg-[#003459] text-[12px] font-extrabold tracking-[-1px] text-white shadow-sm")}>DS</span><div><strong>DataStraw</strong><small>Smart Roster</small></div></div>
-      <div className={cn("flex items-center gap-2.5 max-[760px]:flex-col max-[760px]:items-end [&_label]:flex [&_label]:items-center [&_label]:gap-2 [&_label]:text-[10px] [&_label]:font-semibold [&_label]:text-[#424245] [&_select]:h-8 [&_select]:max-w-[220px] [&_select]:rounded-md [&_select]:border [&_select]:border-[#d2d2d7] [&_select]:bg-white [&_select]:px-2.5 [&_select]:text-[11px] [&_select]:text-[#1d1d1f]")}>
-        <label>Demo role<select value={role} onChange={(event) => props.onRoleChange(event.target.value as Role)}>
-          <option value="manager">Manager</option><option value="pod_lead">Pod lead</option><option value="employee">Employee</option>
-        </select></label>
-        <label>{role === "pod_lead" ? "Pod lead identity" : "Employee identity"}<select value={actorCode}
-          onChange={(event) => props.onIdentityChange(event.target.value)}>
-          {eligibleIdentities.map((item) => <option key={item.employee_code} value={item.employee_code}>
-            {item.employee_code} · {item.full_name}
-          </option>)}
-        </select></label>
-      </div>
+      <UserButton />
     </header>
     <section className={cn("flex justify-between items-end [&_h1]:m-0 [&_h1]:text-[32px] [&_h1]:font-semibold [&_h1]:leading-[1.12] [&_h1]:tracking-[-0.8px] [&_h1]:text-[#1d1d1f] [&_h1]:max-[760px]:text-[29px] [&_p]:mt-[7px] [&_p]:text-[13px] [&_p]:leading-[1.35] [&_p]:text-[#6e6e73] mb-0 min-h-[93px] items-center pb-[25px] max-[760px]:min-h-0 max-[760px]:flex-col max-[760px]:items-start max-[760px]:gap-3 max-[760px]:pb-5")}>
       <div><h1>{role === "pod_lead" ? "Pod schedule" : "My schedule"}</h1>

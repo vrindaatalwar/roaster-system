@@ -25,6 +25,7 @@ Requires Python 3.12+, PostgreSQL, and `uv`.
 4. Start the API:
 
    ```sh
+   set -a; source frontend/.env.local; set +a
    uv run uvicorn app.main:app --app-dir backend --reload
    ```
 
@@ -36,7 +37,7 @@ Requires Python 3.12+, PostgreSQL, and `uv`.
    npm run dev
    ```
 
-   Open the local Vite URL shown in the terminal. The API permits the local Vite origins by default; set `FRONTEND_ORIGINS` to a comma-separated origin list when using another frontend URL. Set `VITE_API_BASE_URL` when the API is not at `http://127.0.0.1:8000`.
+   Open the local Vite URL shown in the terminal. Clerk CLI setup creates `frontend/.env.local` with the development keys. Vite reads the publishable key from that file; the command above makes the Clerk secret available to the local API process. Set `CLERK_AUTHORIZED_PARTIES` to a comma-separated list of exact frontend origins when using another frontend URL. Set `VITE_API_BASE_URL` when the API is not at `http://127.0.0.1:8000`.
 
 The interactive API docs are at `/docs`. Use `POST /api/v1/rosters/generate` with an integer year from the current year through five years ahead and an integer month from 1 to 12 to generate a draft. The response reports coverage totals and pending-availability warnings. Inspect assignments, uncovered slots, and employee-day statuses at `GET /api/v1/rosters/{roster_run_id}`; independent validation is at `/api/v1/rosters/{roster_run_id}/validation`.
 
@@ -52,13 +53,23 @@ The hours layer does not model exact start/end task times, intraday continuity, 
 
 ### Role-based views (development mode)
 
-Use the **Demo role** selector in the top bar to preview the Manager, Pod lead, and Employee experiences. Pod leads must choose an employee configured as a pod lead; their view is read-only and scoped to their led pods. Employee views are read-only and scoped to that employee's own schedule and availability. Manager-only configuration, assignment edits, replanning, and publishing are also checked by the API.
+Sign-in is handled by Clerk. The API verifies the Clerk session JWT and reads the user's role from the signed session claims; the browser cannot select its own role or employee identity. Managers can configure and publish rosters. Pod leads have read-only access to their pod scope, and employees have read-only access to their own schedule and availability.
 
-This is role-based workflow preview without authentication. The browser sends `X-App-Role` and, for pod leads and employees, `X-Employee-Code`; a caller can change those headers and impersonate another demo role or employee. Do not treat these checks as identity verification or expose this unauthenticated mode as a secure production access control system. Add a trusted sign-in provider before using real employee data.
+### Clerk setup
+
+The React app needs `VITE_CLERK_PUBLISHABLE_KEY`. The API needs `CLERK_JWT_KEY` (Clerk's PEM JWT public key) and `CLERK_AUTHORIZED_PARTIES` (comma-separated exact frontend origins, including the local Vite origin and the deployed frontend origin). `CLERK_SECRET_KEY` is not needed for local JWT verification. Do not commit actual keys.
+
+In Clerk Dashboard, configure the session token to include the user's public metadata:
+
+```json
+{"metadata":"{{user.public_metadata}}"}
+```
+
+Set each authorized user's public metadata from Clerk Dashboard. Use `{"role":"manager"}` for a manager, or `{"role":"pod_lead","employee_code":"EMPLOYEE_CODE"}` / `{"role":"employee","employee_code":"EMPLOYEE_CODE"}` for staff. The employee code must match an active employee in the roster database. Accounts without an assigned role are denied access. Never let the client set these public metadata values.
 
 ### Run the complete app with containers
 
-Copy `.env.example` to `.env`, set a local `POSTGRES_PASSWORD`, then run:
+Copy `.env.example` to `.env`, set a local `POSTGRES_PASSWORD`, and set the Clerk publishable key and JWT public key from your Clerk development instance. Then run:
 
 ```sh
 docker compose up --build -d
@@ -81,7 +92,7 @@ All seeded names, brands, holidays, rules, priorities, and availability examples
 4. **Unavailable sole owner:** The manager records and approves an absence. The validator identifies affected slots, the candidate list reports qualified employees who still have capacity, and the manager reviews a proposed replan. If no replacement is feasible, the slot stays uncovered with an explanation.
 5. **Conflicts and insufficient staffing:** The solver maximizes filled coverage without violating hard constraints. It can return a partial draft with uncovered slots and concrete blockers. Preferences are soft goals. The UI labels the result as a draft and shows validation before a manager decides what to change.
 6. **Automation and human control:** Allocation, constraint checks, candidate screening, and proposed replanning are automated. A manager controls availability status, configuration, deadline priority, manual assignment changes, and whether to apply a proposed roster. The manual picker uses the same hard candidate rules as generation.
-7. **Doubling the team and brands:** Keep the relational model and solver constraints, then add database migrations, API pagination, trusted authentication and role-to-identity binding, solver-performance monitoring, and load tests. The current role views are an unauthenticated development preview, not production security. If solve time grows, benchmark the model and consider decomposing by independent coverage groups while preserving global employee capacity constraints.
+7. **Doubling the team and brands:** Keep the relational model and solver constraints, then add database migrations, API pagination, Clerk-backed role-to-identity binding, solver-performance monitoring, and load tests. If solve time grows, benchmark the model and consider decomposing by independent coverage groups while preserving global employee capacity constraints.
 8. **One more week:** Add exact task-time blocks and rest constraints if the business needs intraday coverage validation, then run the expanded model against real historical demand and employee contracts. Replace fictional data with approved operational inputs before production use.
 
 ## Tests and guardrails
