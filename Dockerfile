@@ -18,5 +18,7 @@ RUN npm run build
 
 FROM nginx:alpine AS web
 COPY --from=web-build /web/dist /usr/share/nginx/html
-COPY deploy/nginx.conf /etc/nginx/conf.d/default.conf
+COPY deploy/nginx.conf.template /etc/nginx/templates/default.conf.template
+ENV API_UPSTREAM=http://backend:8000 \
+    NGINX_ENVSUBST_FILTER=API_UPSTREAM
 EXPOSE 80
