@@ -1375,7 +1375,7 @@ def list_rosters(request: Request, year: int | None = None, month: int | None = 
         query = query.where(RosterRun.year == year)
     if month is not None:
         query = query.where(RosterRun.month == month)
-    if request.state.actor_role == "employee":
+    if request.state.actor_role != "manager":
         query = query.where(RosterRun.status == RosterStatus.PUBLISHED)
     runs = session.scalars(query.order_by(RosterRun.id.desc())).all()
     result = []
@@ -1430,7 +1430,7 @@ def roster_detail(roster_run_id: int, request: Request,
     ).where(RosterRun.id == roster_run_id))
     if run is None:
         raise HTTPException(status_code=404, detail="Roster run not found")
-    if actor_role == "employee" and run.status != RosterStatus.PUBLISHED:
+    if actor_role != "manager" and run.status != RosterStatus.PUBLISHED:
         raise HTTPException(status_code=404, detail="Published roster not found.")
     report = run.generation_report
     schedules_by_rule = {item.brand_process_rule_id: item.pod_id
@@ -1732,6 +1732,10 @@ def _refresh_employee_day(session: Session, run: RosterRun, employee_id: int, da
 def roster_validation(roster_run_id: int, request: Request,
                       session: Session = Depends(get_session)) -> dict:
     """Validate persisted assignments independently against current configuration."""
+    if request.state.actor_role != "manager":
+        run = session.get(RosterRun, roster_run_id)
+        if run is None or run.status != RosterStatus.PUBLISHED:
+            raise HTTPException(status_code=404, detail="Published roster not found.")
     try:
         result = validate_roster(session, roster_run_id)
     except LookupError as error:
