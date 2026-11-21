@@ -21,8 +21,7 @@ services:
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-datastraw}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-datastraw_roster}
-      CLERK_JWT_KEY: ${CLERK_JWT_KEY:-}
-      CLERK_AUTHORIZED_PARTIES: ${CLERK_AUTHORIZED_PARTIES:-http://localhost:8080}
+      FRONTEND_ORIGINS: http://localhost:8080
     depends_on:
       db:
         condition: service_healthy
@@ -33,7 +32,6 @@ services:
       target: web
       args:
         VITE_API_BASE_URL: ""
-        VITE_CLERK_PUBLISHABLE_KEY: ${VITE_CLERK_PUBLISHABLE_KEY:-}
     restart: unless-stopped
     ports:
       - "${APP_PORT:-8080}:80"

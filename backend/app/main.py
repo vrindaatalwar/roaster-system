@@ -9,7 +9,7 @@ from urllib.request import Request, urlopen
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from clerk_backend_api import AuthenticateRequestOptions, authenticate_request
+from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field, StrictBool, StrictInt, field_validator, model_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, selectinload
@@ -31,73 +31,73 @@ from starlette.responses import JSONResponse
 
 app = FastAPI(title="DataStraw Smart Roster", version="0.1.0")
 allowed_origins = os.getenv(
-    "CLERK_AUTHORIZED_PARTIES",
-    os.getenv("FRONTEND_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"),
+    "FRONTEND_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
 ).split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in allowed_origins if origin.strip()],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "X-App-Role", "X-Employee-Code"],
 )
 
 
+def openapi_with_demo_role_headers() -> dict:
+    """Make the unauthenticated demo role inputs visible in Swagger UI."""
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(title=app.title, version=app.version, routes=app.routes)
+    for path, operations in schema.get("paths", {}).items():
+        if not path.startswith("/api/v1/") or path == "/api/v1/demo-identities":
+            continue
+        for operation in operations.values():
+            if not isinstance(operation, dict):
+                continue
+            parameters = operation.setdefault("parameters", [])
+            parameters.extend([
+                {"name": "X-App-Role", "in": "header", "required": True,
+                 "description": "Demo role: manager, pod_lead, or employee. This is not authentication.",
+                 "schema": {"type": "string", "enum": ["manager", "pod_lead", "employee"]}},
+                {"name": "X-Employee-Code", "in": "header", "required": False,
+                 "description": "Required for pod_lead and employee roles; ignored for manager.",
+                 "schema": {"type": "string"}},
+            ])
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = openapi_with_demo_role_headers
+
+
 @app.middleware("http")
-async def enforce_clerk_role_access(request: Request, call_next):
-    """Verify Clerk sessions and derive all authorization data from trusted claims."""
-    if request.method == "OPTIONS" or not request.url.path.startswith("/api/v1/"):
+async def enforce_demo_role_access(request: Request, call_next):
+    """Apply role permissions using a selectable, unauthenticated demo identity.
+
+    The role and employee headers are intentionally not authentication. They let
+    the UI demonstrate role-specific access until a trusted identity provider is
+    added; callers can currently change these headers themselves.
+    """
+    if (request.method == "OPTIONS" or not request.url.path.startswith("/api/v1/")
+            or request.url.path == "/api/v1/demo-identities"):
         return await call_next(request)
 
-    jwt_key = os.getenv("CLERK_JWT_KEY", "").replace("\\n", "\n").strip()
-    secret_key = os.getenv("CLERK_SECRET_KEY", "").strip()
-    if not jwt_key and not secret_key:
-        return JSONResponse(status_code=503, content={
-            "detail": "Clerk authentication is not configured on the API.",
-        })
-    authorized_parties = [
-        origin.strip() for origin in os.getenv(
-            "CLERK_AUTHORIZED_PARTIES", os.getenv("FRONTEND_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
-        ).split(",") if origin.strip()
-    ]
-    try:
-        auth = authenticate_request(
-            request,
-            AuthenticateRequestOptions(
-                jwt_key=jwt_key or None,
-                secret_key=secret_key or None,
-                authorized_parties=authorized_parties,
-                accepts_token=["session_token"],
-            ),
-        )
-    except Exception:
-        return JSONResponse(status_code=401, content={"detail": "A valid Clerk session is required."})
-    claims = auth.payload or {}
-    if auth.status.value != "signed-in" or not claims.get("sub"):
-        return JSONResponse(status_code=401, content={
-            "detail": "Sign in to continue.",
-        })
-
-    metadata = claims.get("metadata")
-    metadata = metadata if isinstance(metadata, dict) else {}
-    role = str(metadata.get("role", "")).strip().lower()
+    role = request.headers.get("X-App-Role", "").strip().lower()
     if role not in {"manager", "pod_lead", "employee"}:
-        return JSONResponse(status_code=403, content={
-            "detail": "Your Clerk account does not have an app role. Ask an administrator to assign one.",
+        return JSONResponse(status_code=401, content={
+            "detail": "Select a demo role using the X-App-Role header.",
         })
 
     request.state.actor_role = role
-    request.state.clerk_user_id = claims["sub"]
     request.state.actor_employee_id = None
     request.state.actor_employee_code = None
     request.state.actor_pod_ids = set()
     request.state.actor_member_ids = set()
 
     if role != "manager":
-        employee_code = str(metadata.get("employee_code", "")).strip()
+        employee_code = request.headers.get("X-Employee-Code", "").strip()
         if not employee_code:
-            return JSONResponse(status_code=403, content={
-                "detail": "Your account is missing an employee identity. Ask an administrator to assign one.",
+            return JSONResponse(status_code=401, content={
+                "detail": "Select an employee identity using the X-Employee-Code header.",
             })
         with SessionLocal() as session:
             employee = session.scalar(select(Employee).where(
@@ -106,7 +106,7 @@ async def enforce_clerk_role_access(request: Request, call_next):
             ))
             if employee is None:
                 return JSONResponse(status_code=403, content={
-                    "detail": "Your linked employee record is not active.",
+                    "detail": "The selected demo identity is not an active employee.",
                 })
             if role == "pod_lead" and not employee.is_pod_lead:
                 return JSONResponse(status_code=403, content={
@@ -560,19 +560,14 @@ def delete_priority_override(override_id: int, session: Session = Depends(get_se
     return {"status": "removed"}
 
 
-@app.get("/api/v1/me")
-def current_user(request: Request, session: Session = Depends(get_session)) -> dict:
-    """Return the role and linked employee identity from the verified Clerk session."""
-    employee_code = request.state.actor_employee_code
-    employee = None
-    if employee_code:
-        row = session.scalar(select(Employee).where(Employee.employee_code == employee_code))
-        if row:
-            employee = {"employee_code": row.employee_code, "full_name": row.full_name,
-                        "is_pod_lead": row.is_pod_lead}
-    return {"clerk_user_id": request.state.clerk_user_id,
-            "role": request.state.actor_role,
-            "employee": employee}
+@app.get("/api/v1/demo-identities")
+def demo_identities(session: Session = Depends(get_session)) -> list[dict]:
+    """List selectable demo identities; this endpoint contains no schedule data."""
+    employees = session.scalars(select(Employee).where(
+        Employee.status == "active",
+    ).order_by(Employee.employee_code)).all()
+    return [{"employee_code": item.employee_code, "full_name": item.full_name,
+             "is_pod_lead": item.is_pod_lead} for item in employees]
 
 
 @app.get("/health")
