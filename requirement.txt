@@ -30,7 +30,7 @@ Operations manager:
 - Maintains employees, pods, pod leads, skills, brands, processes, resource eligibility, calendars, staffing requirements, and availability rules.
 - Generates and reviews monthly rosters.
 - Reviews uncovered work and suggested replacements.
-- Makes manual edits, accepts or rejects suggestions, and is the sole role allowed to publish. A roster with mandatory coverage gaps or hard-rule violations remains a draft and cannot be published in v1.
+- Makes manual edits, accepts or rejects suggestions, and is the sole role allowed to publish. Hard-rule violations block publication. A roster with coverage gaps may be published as a clearly marked partial roster only after the manager explicitly confirms the gaps; publication does not imply complete coverage.
 
 Pod lead:
 - Oversees the members and schedules in their pod.
@@ -90,7 +90,7 @@ Managers must be able to configure employee-to-brand/process eligibility without
 - Accept only integer years from the current calendar year through five years ahead and integer months from 1 through 12; reject past years, years beyond that planning horizon, and invalid values with a client error and do not create a roster run.
 - Consider brand/process operating calendars, minimum coverage, employee eligibility, availability, weekly offs, approved leave, approved comp-offs, public holidays, workload capacity, and configured preferences.
 - Produce assignments identifying employee, date, brand, process, and status (working, off, leave, uncovered, or other configured status).
-- Do not silently publish an invalid roster. If all requirements cannot be met, show the best available partial result, identify uncovered requirements, and explain the cause.
+- Do not silently publish an invalid roster. If all requirements cannot be met, show the best available partial result, identify uncovered requirements, and explain the cause. The manager may explicitly publish that partial roster after a fresh validation confirms there are no hard-rule violations; keep every uncovered requirement visible to managers and scoped read-only viewers.
 
 5.2 Allocation rationale
 For each assignment or replacement recommendation, show a concise reason based on the actual inputs, such as:

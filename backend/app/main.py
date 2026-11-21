@@ -4,6 +4,8 @@ import calendar
 from collections import Counter, defaultdict
 from datetime import date, timedelta
 import os
+import re
+from urllib.request import Request, urlopen
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -192,6 +194,10 @@ class AvailabilityChangeRequest(BaseModel):
 
 class AvailabilityStatusRequest(BaseModel):
     approval_status: ApprovalStatus
+
+
+class PublishRosterRequest(BaseModel):
+    confirm_gaps: StrictBool = False
 
 
 class EmployeeConfigurationRequest(BaseModel):
@@ -431,6 +437,43 @@ def validate_staffing_limit(minimum_staff: int | None, maximum_staff: int | None
 def create_schema() -> None:
     """Create the assessment demo schema when the API starts."""
     upgrade_schema(engine)
+    sync_maharashtra_holidays()
+
+
+def sync_maharashtra_holidays() -> None:
+    """Refresh the locally cached Maharashtra state-government holiday calendar."""
+    feed_url = "https://api.accountable.social/api/v1/public/city-tools/calendar/maharashtra/state_government_offices.ics"
+    try:
+        request = Request(feed_url, headers={"User-Agent": "DataStraw-Smart-Roster/1.0"})
+        with urlopen(request, timeout=5) as response:
+            calendar_text = response.read().decode("utf-8")
+    except Exception:
+        # Keep the last successful local copy if the feed is temporarily unavailable.
+        return
+    events = []
+    for event in calendar_text.split("BEGIN:VEVENT")[1:]:
+        date_match = re.search(r"^DTSTART(?:;VALUE=DATE)?:(\d{8})", event, re.M)
+        name_match = re.search(r"^SUMMARY(?:;[^:]*)?:(.+)$", event, re.M)
+        if date_match and name_match:
+            try:
+                holiday_date = date.fromisoformat(
+                    f"{date_match.group(1)[:4]}-{date_match.group(1)[4:6]}-{date_match.group(1)[6:]}"
+                )
+            except ValueError:
+                continue
+            name = name_match.group(1).replace(r"\,", ",").replace(r"\;", ";").replace(r"\n", " ").strip()
+            events.append((name[:100], holiday_date))
+    if not events:
+        return
+    with SessionLocal() as session:
+        session.query(PublicHoliday).filter(PublicHoliday.is_demo_data.is_(True)).delete(synchronize_session=False)
+        for name, holiday_date in events:
+            existing = session.scalar(select(PublicHoliday.id).where(
+                PublicHoliday.name == name, PublicHoliday.holiday_date == holiday_date
+            ))
+            if existing is None:
+                session.add(PublicHoliday(name=name, holiday_date=holiday_date, is_demo_data=True))
+        session.commit()
 
 
 def allocation_settings_payload(session: Session) -> dict:
@@ -1362,6 +1405,13 @@ def generate_roster(payload: GenerateRosterRequest,
         )
     if not 1 <= payload.month <= 12:
         raise HTTPException(status_code=422, detail="Month must be between 1 and 12.")
+    requested_month = date(payload.year, payload.month, 1)
+    current_month = date.today().replace(day=1)
+    if requested_month < current_month:
+        raise HTTPException(
+            status_code=422,
+            detail="A roster can only be generated for the current month or a future month.",
+        )
     return generate_month(session, payload.year, payload.month)
 
 
@@ -1777,19 +1827,28 @@ def roster_validation(roster_run_id: int, request: Request,
 
 
 @app.post("/api/v1/rosters/{roster_run_id}/publish")
-def publish_roster(roster_run_id: int, session: Session = Depends(get_session)) -> dict:
+def publish_roster(roster_run_id: int, payload: PublishRosterRequest = PublishRosterRequest(),
+                   session: Session = Depends(get_session)) -> dict:
     run = session.get(RosterRun, roster_run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Roster run not found.")
     checks = validate_roster(session, run.id)
-    if checks["error_count"] or checks.get("gap_count", 0):
+    if checks["error_count"]:
         raise HTTPException(status_code=409, detail={
-            "message": "This roster has mandatory coverage gaps or hard-rule conflicts and must remain a draft.",
+            "message": "This roster has hard-rule violations and must remain a draft. Resolve them before publishing.",
+            "validation": checks,
+        })
+    if checks.get("gap_count", 0) and not payload.confirm_gaps:
+        raise HTTPException(status_code=409, detail={
+            "message": (f"This roster still has {checks['gap_count']} coverage gap(s). "
+                        "Confirm partial publication to make it visible with gaps clearly marked."),
+            "requires_gap_confirmation": True,
             "validation": checks,
         })
     run.status = RosterStatus.PUBLISHED
     session.commit()
-    return {"roster_run_id": run.id, "status": run.status.value, "validation": checks}
+    return {"roster_run_id": run.id, "status": run.status.value,
+            "published_with_gaps": bool(checks.get("gap_count", 0)), "validation": checks}
 
 
 @app.post("/api/v1/rosters/{roster_run_id}/replan-preview")

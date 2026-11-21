@@ -100,3 +100,11 @@ button {
     @apply bg-background text-foreground;
   }
 }
+
+/* Product readability floor: keep every UI text utility at 14px or larger. */
+@layer utilities {
+  [class~="text-[9px]"], [class~="text-[10px]"], [class~="text-[11px]"],
+  [class~="text-[12px]"], [class~="text-[13px]"], [class~="text-xs"] {
+    font-size: 14px !important;
+  }
+}

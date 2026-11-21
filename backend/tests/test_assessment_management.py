@@ -12,8 +12,10 @@ from app.main import (
     BrandProcessConfigurationRequest,
     BrandConfigurationRequest,
     EmployeeConfigurationRequest,
+    GenerateRosterRequest,
     EligibilityChangeRequest,
     PodConfigurationRequest,
+    PublishRosterRequest,
     ProcessConfigurationRequest,
     create_brand_process_rule,
     change_eligibility,
@@ -22,6 +24,7 @@ from app.main import (
     create_pod,
     create_process,
     edit_roster_assignment,
+    generate_roster,
     publish_roster,
     update_employee,
     update_pod,
@@ -99,6 +102,15 @@ class AssessmentManagementTests(unittest.TestCase):
         self.session.close()
         self.engine.dispose()
 
+    def test_roster_generation_rejects_a_past_month(self):
+        current = date.today()
+        if current.month == 1:
+            self.skipTest("No earlier month exists in the current year.")
+        payload = GenerateRosterRequest(year=current.year, month=current.month - 1)
+        with self.assertRaises(HTTPException) as raised:
+            generate_roster(payload, session=self.session)
+        self.assertEqual(raised.exception.status_code, 422)
+
     def test_manager_can_add_employee_with_configured_skills_and_capacity(self):
         payload = EmployeeConfigurationRequest(
             employee_code="EMP003", full_name="New Employee", role_title="Specialist",
@@ -139,6 +151,17 @@ class AssessmentManagementTests(unittest.TestCase):
         self.assertEqual(pod_b.specialization, "Customer Operations")
         schedule = self.session.scalar(select(PodSchedule).where(PodSchedule.pod_id == pod_b.id))
         self.assertEqual(schedule.allocation_capacity_hours, 5)
+
+        # Assigning a different lead to this pod replaces the existing lead.
+        update_pod(pod_b.id, PodConfigurationRequest(
+            name="Pod B", specialization="Customer Operations", lead_employee_code="EMP001",
+            member_employee_codes=["EMP001", "EMP002"],
+            shift_name="Late Window", shift_start="13:00", shift_end="22:00",
+            break_start="17:00", break_end="18:00", allocation_capacity_hours=5,
+        ), session=self.session)
+        self.assertEqual(pod_b.lead.employee_code, "EMP001")
+        self.assertFalse(self.employees[1].is_pod_lead)
+        self.assertTrue(self.employees[0].is_pod_lead)
 
     def test_manager_can_create_brand_process_calendar_and_staffing_rule(self):
         self.session.add(PodSchedule(
@@ -264,15 +287,22 @@ class AssessmentManagementTests(unittest.TestCase):
         self.assertEqual(employee_day.assigned_effort_hours, 4)
         self.assertEqual(employee_day.status, EmployeeRosterDayStatus.OFF)
 
-    def test_publish_rejects_uncovered_roster(self):
+    def test_partial_publish_requires_explicit_gap_confirmation(self):
         run = RosterRun(year=2027, month=1)
         self.session.add(run)
         self.session.commit()
 
         with self.assertRaises(HTTPException) as caught:
-            publish_roster(run.id, session=self.session)
+            publish_roster(run.id, PublishRosterRequest(), session=self.session)
         self.assertEqual(caught.exception.status_code, 409)
+        self.assertTrue(caught.exception.detail["requires_gap_confirmation"])
         self.assertEqual(run.status.value, "draft")
+
+        result = publish_roster(
+            run.id, PublishRosterRequest(confirm_gaps=True), session=self.session,
+        )
+        self.assertEqual(result["status"], "published")
+        self.assertTrue(result["published_with_gaps"])
 
     def test_publish_accepts_roster_after_independent_validation(self):
         run = RosterRun(year=2027, month=1)

@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 from datetime import date
 
 from sqlalchemy import delete, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from .database import Base, SessionLocal, engine
 from .migrations import upgrade_schema
@@ -50,6 +50,8 @@ BRAND_NAMES = [
     "BrightCart", "Juneberry Skin", "Harbor & Pine", "Kindred Kitchen", "Cloudberry Kids",
     "Saffron Trail", "Daybreak Goods", "Blue Fern Market", "Orbit Organics", "Paper Kite Co.",
 ]
+# Fictional demo values across the full manager-priority range, not real client policy.
+BRAND_DEMO_PRIORITIES = [5, 4, 3, 2, 1, 4, 3, 2, 5, 3, 1, 4, 2, 5, 3]
 
 PROCESS_SPECS = [
     ("CS", "Customer Support", "Respond to customer questions and issues.", "Customer support", 6.0),
@@ -78,6 +80,103 @@ def _calendar_for(brand_index: int, process_index: int) -> tuple[list[int], bool
     return list(range(5)), False
 
 
+def _reconcile_demo_allocation_inputs(session: Session) -> None:
+    """Repair existing fictional seed inputs to match the documented allocator model."""
+    employees = session.scalars(select(Employee).options(
+        selectinload(Employee.skills), selectinload(Employee.weekly_offs),
+    ).where(Employee.status == "active")).all()
+    rules = session.scalars(select(BrandProcessRule).options(
+        selectinload(BrandProcessRule.brand), selectinload(BrandProcessRule.process),
+        selectinload(BrandProcessRule.eligibility), selectinload(BrandProcessRule.coverage_requirements),
+    )).all()
+    pod_for_rule = {item.brand_process_rule_id: item.pod_id
+                    for item in session.scalars(select(BrandProcessSchedule)).all()}
+    window_by_pod = {item.pod_id: item for item in session.scalars(select(PodSchedule)).all()}
+    employee_by_id = {item.id: item for item in employees}
+    skills_by_employee = {item.id: {skill.id for skill in item.skills} for item in employees}
+    offs_by_employee = {item.id: {off.weekday for off in item.weekly_offs} for item in employees}
+    memberships = {(item.employee_id, item.pod_id)
+                   for item in session.scalars(select(EmployeePodMembership)).all()}
+    memberships.update((item.id, item.primary_pod_id) for item in employees)
+    eligibility_by_pair = {(item.employee_id, item.brand_process_rule_id): item
+                           for rule in rules for item in rule.eligibility}
+    backup_load = Counter(item.employee_id for rule in rules for item in rule.eligibility
+                          if item.active and item.eligibility_type == EligibilityType.BACKUP)
+
+    # A pod window caps allocatable effort, even when an older saved rule says 8h.
+    for rule in rules:
+        if not rule.brand.is_demo_data:
+            continue
+        pod_id = pod_for_rule.get(rule.id)
+        window = window_by_pod.get(pod_id) if pod_id is not None else None
+        capacity = min(6.0, window.allocation_capacity_hours) if window else 6.0
+        if rule.effort_hours_per_employee > capacity:
+            rule.effort_hours_per_employee = capacity
+
+        # Never leave a demo eligibility link active when the employee lacks its skill.
+        for link in rule.eligibility:
+            employee = employee_by_id.get(link.employee_id)
+            if link.active and (employee is None or rule.required_skill_id not in skills_by_employee[employee.id]):
+                link.active = False
+
+    existing_by_rule: dict[int, set[int]] = defaultdict(set)
+    for rule in rules:
+        if not rule.brand.is_demo_data:
+            continue
+        for link in rule.eligibility:
+            employee = employee_by_id.get(link.employee_id)
+            if link.active and employee and rule.required_skill_id in skills_by_employee[employee.id]:
+                existing_by_rule[rule.id].add(employee.id)
+
+    for rule in rules:
+        if not rule.brand.is_demo_data or (rule.brand.code == "BRD012" and rule.process.code == "NDR"):
+            continue
+        required_pod = pod_for_rule.get(rule.id)
+        if required_pod is None:
+            continue
+        target_count = 5 if rule.brand.code == "BRD014" and rule.process.code == "CS" else 4
+        qualified = existing_by_rule[rule.id]
+        needed = max(0, target_count - len(qualified))
+        if not needed:
+            continue
+        pool = [employee for employee in employees
+                if rule.required_skill_id in skills_by_employee[employee.id]
+                and employee.id not in qualified]
+        for _ in range(min(needed, len(pool))):
+            def score(candidate: Employee) -> tuple[int, int, int, int]:
+                team = qualified | {candidate.id}
+                fully_off_days = sum(
+                    all(day in offs_by_employee[item_id] for item_id in team)
+                    for day in rule.operating_weekdays
+                )
+                overlap = sum(
+                    len(offs_by_employee[candidate.id] & offs_by_employee[item_id])
+                    for item_id in qualified
+                )
+                return (fully_off_days, overlap, backup_load[candidate.id], candidate.id)
+
+            candidate = min(pool, key=score)
+            pair = (candidate.id, rule.id)
+            link = eligibility_by_pair.get(pair)
+            if link is None:
+                link = EmployeeEligibility(
+                    employee_id=candidate.id, brand_process_rule_id=rule.id,
+                    eligibility_type=EligibilityType.BACKUP, active=True,
+                )
+                session.add(link)
+                eligibility_by_pair[pair] = link
+            else:
+                link.eligibility_type = EligibilityType.BACKUP
+                link.active = True
+            membership = (candidate.id, required_pod)
+            if membership not in memberships:
+                session.add(EmployeePodMembership(employee_id=candidate.id, pod_id=required_pod))
+                memberships.add(membership)
+            qualified.add(candidate.id)
+            pool.remove(candidate)
+            backup_load[candidate.id] += 1
+
+
 def seed_database() -> dict[str, int]:
     upgrade_schema(engine)
     with SessionLocal() as session:
@@ -102,6 +201,35 @@ def seed_database() -> dict[str, int]:
                 .join(BrandProcessRule.process)
                 .where(Brand.code == "BRD002", Process.code == "CS")
             )
+            demo_brands = session.scalars(select(Brand).where(Brand.is_demo_data.is_(True)).order_by(Brand.code)).all()
+            if len(demo_brands) == len(BRAND_DEMO_PRIORITIES):
+                existing_priorities = {
+                    item.brand_id: item for item in session.scalars(select(BrandPriority)).all()
+                }
+                legacy_untouched = all(
+                    (priority := existing_priorities.get(brand.id)) is not None
+                    and priority.priority == (5 if index in {0, 13} else 3)
+                    and priority.deadline_note == ("Urgent demo deadline" if index in {0, 13} else "Routine demo deadline")
+                    for index, brand in enumerate(demo_brands)
+                )
+                if legacy_untouched:
+                    labels = {1: "Routine", 2: "Normal", 3: "Elevated", 4: "Urgent", 5: "Critical"}
+                    for index, brand in enumerate(demo_brands):
+                        priority = existing_priorities[brand.id]
+                        priority.priority = BRAND_DEMO_PRIORITIES[index]
+                        priority.deadline_note = f"Synthetic demo priority: {labels[priority.priority]}"
+                else:
+                    # Seed missing demo priorities without overwriting manager-edited values.
+                    labels = {1: "Routine", 2: "Normal", 3: "Elevated", 4: "Urgent", 5: "Critical"}
+                    for index, brand in enumerate(demo_brands):
+                        if brand.id not in existing_priorities:
+                            priority = BRAND_DEMO_PRIORITIES[index]
+                            session.add(BrandPriority(
+                                brand_id=brand.id,
+                                priority=priority,
+                                deadline_note=f"Synthetic demo priority: {labels[priority]}",
+                            ))
+
             if cross_brand_employee is not None and cross_brand_rule is not None:
                 already_eligible = session.scalar(
                     select(EmployeeEligibility.id).where(
@@ -115,6 +243,7 @@ def seed_database() -> dict[str, int]:
                         brand_process=cross_brand_rule,
                         eligibility_type=EligibilityType.BACKUP,
                     ))
+            _reconcile_demo_allocation_inputs(session)
             session.commit()
             return database_counts(session)
 
@@ -276,9 +405,11 @@ def seed_database() -> dict[str, int]:
                 )
                 rules[(brand_index, process_code)] = rule
                 session.add(rule)
+            demo_priority = BRAND_DEMO_PRIORITIES[brand_index]
+            priority_labels = {1: "Routine", 2: "Normal", 3: "Elevated", 4: "Urgent", 5: "Critical"}
             session.add(BrandPriority(
-                brand_id=brand.id, priority=5 if brand_index in {0, 13} else 3,
-                deadline_note="Urgent demo deadline" if brand_index in {0, 13} else "Routine demo deadline",
+                brand_id=brand.id, priority=demo_priority,
+                deadline_note=f"Synthetic demo priority: {priority_labels[demo_priority]}",
             ))
         session.flush()
 
@@ -442,6 +573,7 @@ def seed_database() -> dict[str, int]:
                     session.add(EmployeePodMembership(employee_id=employee_id, pod_id=work_pod_id))
                     membership_pairs.add(pair)
 
+        _reconcile_demo_allocation_inputs(session)
         session.commit()
         return database_counts(session)
 
