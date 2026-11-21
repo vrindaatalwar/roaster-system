@@ -73,7 +73,7 @@ Do not assume that pod membership alone qualifies an employee for work. Track se
 Managers must be able to configure employee-to-brand/process eligibility without code changes. Some employees may cover multiple brands/processes where explicitly permitted. A shared or cross-pod backup must be qualified and marked eligible before the solver can recommend them.
 
 4.4 Pod model
-- Pods are manager-configurable teams containing exactly six members in the initial sample setup. The manager UI may support other pod sizes; six is a seed-data choice, not a system limit.
+- Pods are manager-configurable teams. The assessment requires multiple pods but does not prescribe a fixed pod size. The demo has 30 employees across two pods, one primary pod per employee, and optional cross-pod memberships; membership counts may therefore differ between pods. Pod size is not a system limit.
 - Each pod has a pod lead and can have a specialization or workload-management purpose.
 - Pod composition may mix roles (for example CS, ACC, retention, NDR, and cross-trained coverage). All pods do not need identical role mixes.
 - Each employee has one primary pod and may also be explicitly added to a second pod for cross-pod coverage. Membership is configurable; it does not grant skills or brand/process eligibility.
@@ -146,9 +146,9 @@ The following values are the exact defaults used to build and evaluate the asses
 - Process demand is not inferred from brand size, sales, call volume, or historical data. It is the manager-configured minimum headcount multiplied by configured effort hours.
 
 6.2 Employee work pattern and capacity
-- Default demo contract: maximum 5 scheduled days and 40 effort hours in each Monday-to-Sunday calendar week; maximum 6 allocated effort hours in one day, further limited by the assigned pod window.
+- Default demo contract: maximum 5 scheduled days and 40 effort hours in each Monday-to-Sunday calendar week; employees with the CS skill use a 45-hour weekly cap. Maximum 6 allocated effort hours per day still applies, further limited by the assigned pod window.
 - At least 2 days in each Monday-to-Sunday week are unscheduled for each employee. The two days need not be consecutive.
-- Employee-level work patterns may override the default only through explicit configuration. The seed dataset uses the five-day/40-hour contract for all employees, with weekly off days staggered across employees so colleagues on the same brand can have different off days.
+- Employee-level work patterns may override the default only through explicit configuration. The seed dataset uses the five-day pattern, a 40-hour cap for non-CS employees, and a 45-hour cap for CS-skilled employees, with weekly off days staggered across employees so colleagues on the same brand can have different off days. Because the current daily cap is six hours and the workday cap is five days, the effective weekly allocatable ceiling remains 30 hours unless one of those limits is also changed.
 - Overtime is not allowed in v1. If requirements cannot be met within the cap, leave the work uncovered and report the reason.
 - The monthly solver uses the selected month's dates. For calendar weeks partially outside that month, it counts only roster assignments inside the selected month; it does not assume work outside the selected month. This is a demo limitation and must be stated in the UI/README.
 - Minimum rest between shifts and exact task start/end times are out of scope. Pod windows are used to filter eligible assignment candidates and prevent overlapping-window double-booking, but the system does not claim to validate legal working-time compliance.
@@ -175,7 +175,7 @@ The following values are the exact defaults used to build and evaluate the asses
 Hard rules (must never be violated):
 1. Assign only active employees with the required skill and explicit brand/process eligibility.
 2. Do not assign during weekly off, approved leave, approved comp-off, explicit unavailability, or a closed brand/process day.
-3. Do not exceed 8 effort hours per employee per day, 40 effort hours per employee per Monday-Sunday week, or 5 scheduled days per such week.
+3. Do not exceed the employee's configured daily capacity or the assigned pod window's allocation capacity, whichever is lower. Do not exceed the employee's configured weekly-hours limit (40 hours by default and 45 hours for CS-skilled demo employees), or 5 scheduled days per Monday-Sunday week. The 8-hour value is the maximum length of a pod's clock-time window, not the employee's allocatable daily effort limit.
 4. Meet the configured minimum brand/process daily headcount. Do not exceed a configured maximum when one exists; otherwise, avoid unnecessary overstaffing as a soft objective. Each process must have its own distinct eligible headcount, subject to the daily effort-capacity rule.
 5. Never mark an uncovered requirement as covered.
 

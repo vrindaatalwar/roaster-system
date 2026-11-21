@@ -13,13 +13,14 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from .database import Base, SessionLocal, engine, get_session
+from .migrations import upgrade_schema
 from .models import (
-    ApprovalStatus, AssignmentStatus, AvailabilityException, AvailabilityType, Brand,
+    AllocationSetting, ApprovalStatus, AssignmentStatus, AvailabilityException, AvailabilityType, Brand,
     BrandPriority, BrandProcessRule, BrandProcessSchedule, Employee, EmployeeEligibility,
     EmployeePodMembership,
     EmployeeRosterDayStatus, EmployeeSkill, EmployeeWeeklyOff, EmployeeWorkContract,
     EligibilityType, CoverageRequirement, Pod, PodSchedule, Process, PublicHoliday, RosterAssignment,
-    RosterEmployeeDay, RosterRun, RosterStatus, Skill,
+    PriorityOverride, RosterEmployeeDay, RosterRun, RosterStatus, Skill,
 )
 from .scheduling import _windows_overlap, generate_month
 from .validation import validate_roster
@@ -205,7 +206,7 @@ class EmployeeConfigurationRequest(BaseModel):
     weekly_off_weekdays: list[StrictInt] = Field(default_factory=list)
     daily_capacity_hours: float = Field(default=6, gt=0, le=8)
     max_days_per_week: StrictInt = Field(default=5, ge=1, le=5)
-    max_hours_per_week: float = Field(default=40, gt=0, le=40)
+    max_hours_per_week: float = Field(default=40, gt=0, le=45)
     minimum_days_off_per_week: StrictInt = Field(default=2, ge=0, le=6)
 
     @field_validator("employee_code", "full_name", "role_title", "pod_name", mode="before")
@@ -239,6 +240,12 @@ class EmployeeConfigurationRequest(BaseModel):
         if len(normalized) != len(set(normalized)):
             raise ValueError("Pod memberships must be unique.")
         return normalized
+
+    @model_validator(mode="after")
+    def validate_cs_weekly_cap(self) -> "EmployeeConfigurationRequest":
+        if self.max_hours_per_week > 40 and "CS" not in self.skills:
+            raise ValueError("A weekly cap above 40 hours is allowed only for employees with the CS skill.")
+        return self
 
 
 class PodConfigurationRequest(BaseModel):
@@ -281,6 +288,36 @@ class BrandConfigurationRequest(BaseModel):
     active: bool = True
     deadline_priority: StrictInt = Field(default=3, ge=1, le=5)
     deadline_note: str = Field(default="", max_length=200)
+    client_tier: StrictInt = Field(default=3, ge=1, le=5)
+    deadline_date: date | None = None
+
+
+class AllocationSettingsRequest(BaseModel):
+    capacity_units: StrictInt = Field(default=12, ge=1, le=16)
+    min_chunk_units: StrictInt = Field(default=1, ge=1, le=16)
+    max_brands_per_day: StrictInt = Field(default=2, ge=1, le=15)
+    hours_layer_enabled: StrictBool = False
+    solver_time_limit_seconds: StrictInt = Field(default=60, ge=1, le=600)
+
+    @model_validator(mode="after")
+    def validate_units(self) -> "AllocationSettingsRequest":
+        if self.min_chunk_units > self.capacity_units:
+            raise ValueError("Minimum allocation chunk cannot exceed daily capacity.")
+        return self
+
+
+class PriorityOverrideRequest(BaseModel):
+    brand_code: str = Field(min_length=1, max_length=20)
+    start_date: date
+    end_date: date
+    multiplier: float = Field(gt=0, le=10)
+    note: str = Field(default="", max_length=200)
+
+    @model_validator(mode="after")
+    def validate_dates(self) -> "PriorityOverrideRequest":
+        if self.end_date < self.start_date:
+            raise ValueError("End date must be on or after start date.")
+        return self
 
 
 class ProcessConfigurationRequest(BaseModel):
@@ -298,6 +335,7 @@ class BrandProcessConfigurationRequest(BaseModel):
     operating_weekdays: list[StrictInt]
     operate_on_public_holidays: bool = False
     effort_hours_per_employee: float = Field(gt=0, le=6)
+    demand_units: StrictInt | None = Field(default=None, ge=0, le=10000)
     pod_name: str | None = None
     can_share_same_day: bool = False
     minimum_by_weekday: list[StrictInt] = Field(min_length=7, max_length=7)
@@ -339,6 +377,7 @@ class BrandProcessRuleChangeRequest(BaseModel):
     operate_on_public_holidays: StrictBool | None = None
     can_share_same_day: StrictBool | None = None
     effort_hours_per_employee: float | None = Field(default=None, gt=0, le=6)
+    demand_units: StrictInt | None = Field(default=None, ge=0, le=10000)
     weekday: StrictInt | None = Field(default=None, ge=0, le=6)
     minimum_staff: StrictInt | None = Field(default=None, ge=0)
     maximum_staff: StrictInt | None = Field(default=None, ge=0)
@@ -362,6 +401,7 @@ class BrandProcessRuleChangeRequest(BaseModel):
             "minimum_staff", "maximum_staff",
             "pod_name",
             "effort_hours_per_employee",
+            "demand_units",
         }
         if not self.model_fields_set.intersection(change_fields):
             raise ValueError("Provide at least one brand/process setting to change.")
@@ -390,7 +430,91 @@ def validate_staffing_limit(minimum_staff: int | None, maximum_staff: int | None
 @app.on_event("startup")
 def create_schema() -> None:
     """Create the assessment demo schema when the API starts."""
-    Base.metadata.create_all(engine)
+    upgrade_schema(engine)
+
+
+def allocation_settings_payload(session: Session) -> dict:
+    setting = session.get(AllocationSetting, 1)
+    if setting is None:
+        return {"capacity_units": 12, "min_chunk_units": 1, "max_brands_per_day": 2,
+                "hours_layer_enabled": False, "solver_time_limit_seconds": 60}
+    return {"capacity_units": setting.capacity_units, "min_chunk_units": setting.min_chunk_units,
+            "max_brands_per_day": setting.max_brands_per_day,
+            "hours_layer_enabled": setting.hours_layer_enabled,
+            "solver_time_limit_seconds": setting.solver_time_limit_seconds}
+
+
+def priority_overrides_payload(session: Session) -> list[dict]:
+    return [{"id": row.id, "brand_code": row.brand.code, "start_date": row.start_date.isoformat(),
+             "end_date": row.end_date.isoformat(), "multiplier": row.multiplier, "note": row.note}
+            for row in session.scalars(select(PriorityOverride).options(
+                selectinload(PriorityOverride.brand)).order_by(PriorityOverride.start_date)).all()]
+
+
+@app.get("/api/v1/allocation-settings")
+def get_allocation_settings(session: Session = Depends(get_session)) -> dict:
+    return allocation_settings_payload(session)
+
+
+@app.put("/api/v1/allocation-settings")
+def put_allocation_settings(payload: AllocationSettingsRequest,
+                            session: Session = Depends(get_session)) -> dict:
+    setting = session.get(AllocationSetting, 1)
+    if setting is None:
+        setting = AllocationSetting(id=1)
+        session.add(setting)
+    for key, value in payload.model_dump().items():
+        setattr(setting, key, value)
+    session.commit()
+    return allocation_settings_payload(session)
+
+
+@app.get("/api/v1/priority-overrides")
+def get_priority_overrides(session: Session = Depends(get_session)) -> list[dict]:
+    return priority_overrides_payload(session)
+
+
+@app.post("/api/v1/priority-overrides")
+def create_priority_override(payload: PriorityOverrideRequest,
+                             session: Session = Depends(get_session)) -> dict:
+    brand = session.scalar(select(Brand).where(Brand.code == payload.brand_code.strip().upper()))
+    if brand is None:
+        raise HTTPException(status_code=404, detail="Brand not found.")
+    row = PriorityOverride(brand_id=brand.id, start_date=payload.start_date,
+                           end_date=payload.end_date, multiplier=payload.multiplier,
+                           note=payload.note.strip())
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return {"id": row.id, "brand_code": brand.code, "start_date": row.start_date.isoformat(),
+            "end_date": row.end_date.isoformat(), "multiplier": row.multiplier, "note": row.note}
+
+
+@app.patch("/api/v1/priority-overrides/{override_id}")
+def update_priority_override(override_id: int, payload: PriorityOverrideRequest,
+                             session: Session = Depends(get_session)) -> dict:
+    row = session.get(PriorityOverride, override_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Priority override not found.")
+    brand = session.scalar(select(Brand).where(Brand.code == payload.brand_code.strip().upper()))
+    if brand is None:
+        raise HTTPException(status_code=404, detail="Brand not found.")
+    row.brand_id = brand.id
+    row.start_date, row.end_date = payload.start_date, payload.end_date
+    row.multiplier, row.note = payload.multiplier, payload.note.strip()
+    session.commit()
+    return {"id": row.id, "brand_code": brand.code, "start_date": row.start_date.isoformat(),
+            "end_date": row.end_date.isoformat(), "multiplier": row.multiplier, "note": row.note}
+
+
+@app.delete("/api/v1/priority-overrides/{override_id}")
+def delete_priority_override(override_id: int, session: Session = Depends(get_session)) -> dict:
+    row = session.get(PriorityOverride, override_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Priority override not found.")
+    session.delete(row)
+    session.commit()
+    return {"status": "removed"}
 
 
 @app.get("/api/v1/demo-identities")
@@ -456,12 +580,16 @@ def seed_summary(request: Request, session: Session = Depends(get_session)) -> d
                 "operating_weekdays": rule.operating_weekdays,
                 "operate_on_public_holidays": rule.operate_on_public_holidays,
                 "effort_hours_per_employee": rule.effort_hours_per_employee,
+                "demand_units": rule.demand_units,
                 "can_share_same_day": rule.can_share_same_day,
                 "continuous_presence": rule.continuous_presence,
                 "pod_name": pod_by_id[process_schedules[rule.id].pod_id].name
                     if rule.id in process_schedules and process_schedules[rule.id].pod_id in pod_by_id else None,
                 "deadline_priority": priorities[brand.id].priority if brand.id in priorities else 3,
                 "deadline_note": priorities[brand.id].deadline_note if brand.id in priorities else "",
+                "client_tier": priorities[brand.id].client_tier if brand.id in priorities else 3,
+                "deadline_date": priorities[brand.id].deadline_date.isoformat()
+                    if brand.id in priorities and priorities[brand.id].deadline_date else None,
                 "coverage_by_weekday": [
                     {"weekday": item.weekday, "minimum_staff": item.minimum_staff,
                      "maximum_staff": item.maximum_staff}
@@ -478,6 +606,9 @@ def seed_summary(request: Request, session: Session = Depends(get_session)) -> d
                               "active": brand.is_active, "demo_data": brand.is_demo_data,
                               "deadline_priority": priorities[brand.id].priority if brand.id in priorities else 3,
                               "deadline_note": priorities[brand.id].deadline_note if brand.id in priorities else "",
+                              "client_tier": priorities[brand.id].client_tier if brand.id in priorities else 3,
+                              "deadline_date": priorities[brand.id].deadline_date.isoformat()
+                                  if brand.id in priorities and priorities[brand.id].deadline_date else None,
                               "processes": process_details})
 
     result = {
@@ -535,6 +666,8 @@ def seed_summary(request: Request, session: Session = Depends(get_session)) -> d
                              "default_effort_hours": process.default_effort_hours,
                              "enabled": process.enabled} for process in process_catalog],
         "brands": brand_details,
+        "allocation_settings": allocation_settings_payload(session),
+        "priority_overrides": priority_overrides_payload(session),
     }
 
     role = request.state.actor_role
@@ -800,7 +933,8 @@ def create_brand(payload: BrandConfigurationRequest, session: Session = Depends(
     session.add(brand)
     session.flush()
     session.add(BrandPriority(brand_id=brand.id, priority=payload.deadline_priority,
-                              deadline_note=payload.deadline_note.strip()))
+                              deadline_note=payload.deadline_note.strip(), client_tier=payload.client_tier,
+                              deadline_date=payload.deadline_date))
     session.commit()
     return {"brand_code": brand.code, "status": "saved"}
 
@@ -820,6 +954,8 @@ def update_brand(brand_code: str, payload: BrandConfigurationRequest,
         session.add(priority)
     priority.priority = payload.deadline_priority
     priority.deadline_note = payload.deadline_note.strip()
+    priority.client_tier = payload.client_tier
+    priority.deadline_date = payload.deadline_date
     session.commit()
     return {"brand_code": brand.code, "status": "saved"}
 
@@ -917,6 +1053,7 @@ def create_brand_process_rule(payload: BrandProcessConfigurationRequest,
         operating_weekdays=payload.operating_weekdays,
         operate_on_public_holidays=payload.operate_on_public_holidays,
         effort_hours_per_employee=payload.effort_hours_per_employee,
+        demand_units=payload.demand_units,
         can_share_same_day=payload.can_share_same_day, continuous_presence=False,
         notes="Manager-configured assessment rule.",
     )
@@ -1106,6 +1243,7 @@ def change_brand_process_rule(rule_id: int, payload: BrandProcessRuleChangeReque
     old_holiday_behavior = rule.operate_on_public_holidays
     old_share_behavior = rule.can_share_same_day
     old_effort = rule.effort_hours_per_employee
+    old_demand_units = rule.demand_units
     requested_weekday = payload.weekday
     old_minimum = None
     old_maximum = None
@@ -1140,6 +1278,8 @@ def change_brand_process_rule(rule_id: int, payload: BrandProcessRuleChangeReque
         rule.can_share_same_day = changes["can_share_same_day"]
     if "effort_hours_per_employee" in changes:
         rule.effort_hours_per_employee = payload.effort_hours_per_employee
+    if "demand_units" in changes:
+        rule.demand_units = payload.demand_units
     if coverage is not None:
         if "minimum_staff" in changes:
             coverage.minimum_staff = payload.minimum_staff
@@ -1175,7 +1315,10 @@ def change_brand_process_rule(rule_id: int, payload: BrandProcessRuleChangeReque
                 and (day not in holidays or old_holiday_behavior or rule.operate_on_public_holidays)
             )
             pod_changed = old_pod_id != (new_pod.id if new_pod else old_pod_id)
-            if calendar_changed or coverage_changed or sharing_changed or pod_changed or effort_changed:
+            demand_changed = ("demand_units" in changes and payload.demand_units != old_demand_units
+                             and day.weekday() in set(old_weekdays) | set(rule.operating_weekdays)
+                             and (day not in holidays or old_holiday_behavior or rule.operate_on_public_holidays))
+            if calendar_changed or coverage_changed or sharing_changed or pod_changed or effort_changed or demand_changed:
                 dates.append(day.isoformat())
         if dates:
             affected_runs.append({
@@ -1190,12 +1333,14 @@ def change_brand_process_rule(rule_id: int, payload: BrandProcessRuleChangeReque
                      "operate_on_public_holidays": old_holiday_behavior,
                      "can_share_same_day": old_share_behavior,
                      "effort_hours_per_employee": old_effort,
+                     "demand_units": old_demand_units,
                      "pod_id": old_pod_id,
                      "minimum_staff": old_minimum, "maximum_staff": old_maximum},
         "current": {"operating_weekdays": rule.operating_weekdays,
                     "operate_on_public_holidays": rule.operate_on_public_holidays,
                     "can_share_same_day": rule.can_share_same_day,
                     "effort_hours_per_employee": rule.effort_hours_per_employee,
+                    "demand_units": rule.demand_units,
                     "pod_id": new_pod.id if new_pod else old_pod_id,
                     "weekday": requested_weekday,
                     "minimum_staff": coverage.minimum_staff if coverage else None,
@@ -1265,6 +1410,15 @@ def list_rosters(request: Request, year: int | None = None, month: int | None = 
 @app.get("/api/v1/rosters/{roster_run_id}")
 def roster_detail(roster_run_id: int, request: Request,
                   session: Session = Depends(get_session)) -> dict:
+    # Keep direct service calls used by small unit fixtures convenient; HTTP requests
+    # still receive the authenticated-by-demo role scope from middleware.
+    if isinstance(request, Session):
+        session, actor_role, actor_employee_id, actor_member_ids, actor_pod_ids = request, "manager", None, set(), set()
+    else:
+        actor_role = request.state.actor_role
+        actor_employee_id = request.state.actor_employee_id
+        actor_member_ids = request.state.actor_member_ids
+        actor_pod_ids = request.state.actor_pod_ids
     run = session.scalar(select(RosterRun).options(
         selectinload(RosterRun.assignments).selectinload(RosterAssignment.employee),
         selectinload(RosterRun.assignments).selectinload(RosterAssignment.brand_process)
@@ -1276,7 +1430,7 @@ def roster_detail(roster_run_id: int, request: Request,
     ).where(RosterRun.id == roster_run_id))
     if run is None:
         raise HTTPException(status_code=404, detail="Roster run not found")
-    if request.state.actor_role == "employee" and run.status != RosterStatus.PUBLISHED:
+    if actor_role == "employee" and run.status != RosterStatus.PUBLISHED:
         raise HTTPException(status_code=404, detail="Published roster not found.")
     report = run.generation_report
     schedules_by_rule = {item.brand_process_rule_id: item.pod_id
@@ -1284,20 +1438,57 @@ def roster_detail(roster_run_id: int, request: Request,
     pod_by_id = {item.id: item for item in session.scalars(select(Pod)).all()}
     shift_by_pod = {item.pod_id: item for item in session.scalars(select(PodSchedule)).all()}
     priorities_by_brand = {item.brand_id: item.priority for item in session.scalars(select(BrandPriority)).all()}
-    role = request.state.actor_role
-    actor_employee_id = request.state.actor_employee_id
-    visible_member_ids = request.state.actor_member_ids
+    role = actor_role
+    visible_member_ids = actor_member_ids
     visible_assignments = [item for item in run.assignments if (
         role == "manager"
         or (role == "employee" and item.employee_id == actor_employee_id)
         or (role == "pod_lead" and schedules_by_rule.get(item.brand_process_rule_id)
-            in request.state.actor_pod_ids)
+            in actor_pod_ids)
     )]
     visible_employee_days = [item for item in run.employee_days if (
         role == "manager"
         or (role == "employee" and item.employee_id == actor_employee_id)
         or (role == "pod_lead" and item.employee_id in visible_member_ids)
     )]
+    priority_snapshot = (run.allocation_snapshot or {}).get("priority_scores", {})
+    process_day_totals: dict[tuple[int, date], int] = defaultdict(int)
+    for assignment in visible_assignments:
+        if assignment.status == AssignmentStatus.WORKING:
+            process_day_totals[(assignment.brand_process_rule_id, assignment.assignment_date)] += (
+                assignment.hours_units or int(round(assignment.effort_hours * 2))
+            )
+    process_day_allocation = []
+    if role in {"manager", "pod_lead"}:
+        _, month_last_day = calendar.monthrange(run.year, run.month)
+        holidays_for_view = {row.holiday_date for row in session.scalars(select(PublicHoliday)).all()}
+        rules_for_view = session.scalars(select(BrandProcessRule).options(
+            selectinload(BrandProcessRule.brand), selectinload(BrandProcessRule.process),
+            selectinload(BrandProcessRule.coverage_requirements),
+        ).join(BrandProcessRule.brand).where(Brand.is_active.is_(True))).all()
+        for rule in rules_for_view:
+            pod_id = schedules_by_rule.get(rule.id)
+            if role == "pod_lead" and pod_id not in actor_pod_ids:
+                continue
+            minimum_by_weekday = {req.weekday: req.minimum_staff for req in rule.coverage_requirements}
+            for day_number in range(1, month_last_day + 1):
+                day = date(run.year, run.month, day_number)
+                if day.weekday() not in rule.operating_weekdays or (
+                    day in holidays_for_view and not rule.operate_on_public_holidays
+                ):
+                    continue
+                minimum = minimum_by_weekday.get(day.weekday(), 0)
+                demand = rule.demand_units if rule.demand_units is not None else minimum * int(
+                    (run.allocation_snapshot or {}).get("capacity_units", 12)
+                )
+                if not minimum and not demand:
+                    continue
+                process_day_allocation.append({
+                    "brand_code": rule.brand.code, "process_code": rule.process.code,
+                    "date": day.isoformat(), "served_units": process_day_totals.get((rule.id, day), 0),
+                    "demand_units": demand,
+                    "priority_score": priority_snapshot.get(f"{rule.brand.code}:{rule.process.code}:{day.isoformat()}"),
+                })
     generation = None
     if report is not None and role == "manager":
         generation = {
@@ -1307,6 +1498,8 @@ def roster_detail(roster_run_id: int, request: Request,
             "filled_slots": report.filled_slots,
             "uncovered_slots": report.uncovered_slots,
             "explanation": report.explanation,
+            "hours_layer_status": report.hours_layer_status,
+            "solve_time_seconds": report.solve_time_seconds,
         }
     elif report is not None and role == "pod_lead":
         scoped_filled = sum(item.status == AssignmentStatus.WORKING for item in visible_assignments)
@@ -1318,6 +1511,8 @@ def roster_detail(roster_run_id: int, request: Request,
             "filled_slots": scoped_filled,
             "uncovered_slots": scoped_uncovered,
             "explanation": f"This view covers {len(visible_assignments)} required slot(s) in your pod(s).",
+            "hours_layer_status": report.hours_layer_status,
+            "solve_time_seconds": report.solve_time_seconds,
         }
     return {
         "roster_run_id": run.id,
@@ -1332,6 +1527,10 @@ def roster_detail(roster_run_id: int, request: Request,
             "brand_code": item.brand_process.brand.code,
             "process_code": item.brand_process.process.code,
             "effort_hours": item.effort_hours,
+            "hours_units": item.hours_units or int(round(item.effort_hours * 2)),
+            "priority_score": priority_snapshot.get(
+                f"{item.brand_process.brand.code}:{item.brand_process.process.code}:{item.assignment_date.isoformat()}"
+            ),
             "pod_name": (pod_by_id[schedules_by_rule[item.brand_process_rule_id]].name
                          if item.brand_process_rule_id in schedules_by_rule
                          and schedules_by_rule[item.brand_process_rule_id] in pod_by_id else None),
@@ -1351,6 +1550,8 @@ def roster_detail(roster_run_id: int, request: Request,
         } for item in sorted(visible_assignments, key=lambda row: (
             row.assignment_date, row.brand_process.brand.code, row.brand_process.process.code,
         ))],
+        "process_day_allocation": process_day_allocation,
+        "allocation_snapshot": run.allocation_snapshot if role == "manager" else None,
         "employee_days": [{
             "date": item.schedule_date.isoformat(),
             "employee_code": item.employee.employee_code,
@@ -1559,11 +1760,13 @@ def roster_validation(roster_run_id: int, request: Request,
         )]
     counts = Counter(issue["severity"] for issue in visible_issues)
     result.update({
-        "status": "needs_attention" if counts["error"] else
+        "status": "needs_attention" if counts["error"] or counts["gap"] else
                   "valid_with_warnings" if counts["warning"] else "valid",
         "issue_count": len(visible_issues),
         "error_count": counts["error"],
         "warning_count": counts["warning"],
+        "gap_count": counts["gap"],
+        "hard_violation_count": counts["error"],
         "issues": visible_issues,
     })
     return result
@@ -1575,7 +1778,7 @@ def publish_roster(roster_run_id: int, session: Session = Depends(get_session)) 
     if run is None:
         raise HTTPException(status_code=404, detail="Roster run not found.")
     checks = validate_roster(session, run.id)
-    if checks["error_count"]:
+    if checks["error_count"] or checks.get("gap_count", 0):
         raise HTTPException(status_code=409, detail={
             "message": "This roster has mandatory coverage gaps or hard-rule conflicts and must remain a draft.",
             "validation": checks,
@@ -1692,9 +1895,7 @@ def preview_replan(roster_run_id: int, payload: ReplanRosterRequest,
                     "explanation": explanation,
                 })
 
-        required = sum(row.assignment_date in affected for row in proposed_rows)
-        filled = sum(row.assignment_date in affected and row.status == AssignmentStatus.WORKING
-                     for row in proposed_rows)
+        required, filled = _coverage_totals(session, source.year, source.month, affected, proposed_rows)
         uncovered = required - filled
         response = {
             "source_roster_run_id": roster_run_id,
@@ -1718,6 +1919,30 @@ def preview_replan(roster_run_id: int, payload: ReplanRosterRequest,
     finally:
         session.rollback()
     return response
+
+
+def _coverage_totals(session: Session, year: int, month: int, affected: set[date],
+                     rows: list[RosterAssignment]) -> tuple[int, int]:
+    """Count minimum staffing slots, independent of how many hour chunks are saved."""
+    rules = session.scalars(select(BrandProcessRule).options(
+        selectinload(BrandProcessRule.coverage_requirements),
+    ).join(BrandProcessRule.brand).where(Brand.is_active.is_(True))).all()
+    holidays = {row.holiday_date for row in session.scalars(select(PublicHoliday)).all()}
+    assigned = Counter((row.brand_process_rule_id, row.assignment_date)
+                       for row in rows if row.status == AssignmentStatus.WORKING)
+    required_total = filled_total = 0
+    for rule in rules:
+        minimum_by_weekday = {item.weekday: item.minimum_staff for item in rule.coverage_requirements}
+        for day in affected:
+            if day.year != year or day.month != month or day.weekday() not in rule.operating_weekdays:
+                continue
+            if day in holidays and not rule.operate_on_public_holidays:
+                continue
+            required = minimum_by_weekday.get(day.weekday(), 0)
+            if required:
+                required_total += required
+                filled_total += min(required, assigned[(rule.id, day)])
+    return required_total, filled_total
 
 
 @app.post("/api/v1/rosters/{roster_run_id}/replan")
@@ -1774,6 +1999,9 @@ def replan_roster(roster_run_id: int, payload: ReplanRosterRequest,
     new_rows = session.scalars(select(RosterAssignment).where(
         RosterAssignment.roster_run_id == result["roster_run_id"],
     )).all()
+    affected_required, affected_filled = _coverage_totals(
+        session, source.year, source.month, affected, new_rows,
+    )
     old_unaffected = Counter((row.assignment_date, row.brand_process_rule_id,
                               row.employee_id, row.status.value)
                              for row in old_rows if row.assignment_date not in affected)
@@ -1782,6 +2010,9 @@ def replan_roster(roster_run_id: int, payload: ReplanRosterRequest,
                              for row in new_rows if row.assignment_date not in affected)
     result["before_validation"] = before_validation
     result["after_validation"] = after_validation
+    result["affected_required_slots"] = affected_required
+    result["affected_filled_slots"] = affected_filled
+    result["affected_uncovered_slots"] = affected_required - affected_filled
     result["unaffected_assignments_preserved"] = old_unaffected == new_unaffected
     result["affected_dates"] = sorted(day.isoformat() for day in affected)
     return result
@@ -1823,6 +2054,20 @@ def replacement_candidates(roster_run_id: int, assignment_date: date,
             ),
         }
 
+    target_pod_id = session.scalar(select(BrandProcessSchedule.pod_id).where(
+        BrandProcessSchedule.brand_process_rule_id == rule.id,
+    ))
+    target_window = session.scalar(select(PodSchedule).where(PodSchedule.pod_id == target_pod_id)) \
+        if target_pod_id is not None else None
+    pod_windows = {item.pod_id: item for item in session.scalars(select(PodSchedule)).all()}
+    pod_by_rule = {item.brand_process_rule_id: item.pod_id
+                   for item in session.scalars(select(BrandProcessSchedule)).all()}
+    memberships: dict[int, set[int]] = defaultdict(set)
+    for link in session.scalars(select(EmployeePodMembership)).all():
+        memberships[link.employee_id].add(link.pod_id)
+    for employee in session.scalars(select(Employee)).all():
+        memberships[employee.id].add(employee.primary_pod_id)
+
     excluded_employee = None
     if excluding_employee_code:
         excluded_employee = session.scalar(select(Employee).where(
@@ -1842,11 +2087,13 @@ def replacement_candidates(roster_run_id: int, assignment_date: date,
     weekly_hours: Counter[int] = Counter()
     weekly_days: dict[int, set[date]] = defaultdict(set)
     same_process_employees = set()
+    day_rows = []
     iso = assignment_date.isocalendar()
     for row in month_assignments:
         if row.employee_id == (excluded_employee.id if excluded_employee else None):
             continue
         if row.assignment_date == assignment_date:
+            day_rows.append(row)
             daily_hours[row.employee_id] += row.effort_hours
             if row.brand_process_rule_id == rule.id:
                 same_process_employees.add(row.employee_id)
@@ -1868,6 +2115,9 @@ def replacement_candidates(roster_run_id: int, assignment_date: date,
         if rule.required_skill_id not in {skill.id for skill in employee.skills}:
             excluded_reasons["missing required skill"] += 1
             continue
+        if target_pod_id is not None and target_pod_id not in memberships.get(employee.id, set()):
+            excluded_reasons["not a member of the required pod"] += 1
+            continue
         if assignment_date.weekday() in {off.weekday for off in employee.weekly_offs}:
             excluded_reasons["weekly off"] += 1
             continue
@@ -1886,8 +2136,27 @@ def replacement_candidates(roster_run_id: int, assignment_date: date,
             excluded_reasons["missing capacity configuration"] += 1
             continue
         effort = rule.effort_hours_per_employee
-        if daily_hours[employee.id] + effort > contract.daily_capacity_hours:
+        other_pod_ids = [pod_by_rule.get(row.brand_process_rule_id)
+                         for row in day_rows if row.employee_id == employee.id]
+        has_window_work = target_pod_id is not None or any(pod_id is not None for pod_id in other_pod_ids)
+        daily_capacity = min(contract.daily_capacity_hours, 6.0) if has_window_work else contract.daily_capacity_hours
+        if daily_hours[employee.id] + effort > daily_capacity:
             excluded_reasons["daily capacity"] += 1
+            continue
+        target_pod_hours = sum(
+            row.effort_hours for row in day_rows
+            if row.employee_id == employee.id and pod_by_rule.get(row.brand_process_rule_id) == target_pod_id
+        )
+        target_pod_capacity = target_window.allocation_capacity_hours if target_window else 6.0
+        if target_pod_id is not None and target_pod_hours + effort > target_pod_capacity:
+            excluded_reasons["pod window capacity"] += 1
+            continue
+        if any(
+            target_pod_id is not None and other_pod_id is not None and other_pod_id != target_pod_id
+            and _windows_overlap(target_window, pod_windows.get(other_pod_id))
+            for other_pod_id in other_pod_ids
+        ):
+            excluded_reasons["overlapping pod window"] += 1
             continue
         if weekly_hours[employee.id] + effort > contract.max_hours_per_week:
             excluded_reasons["weekly hours"] += 1

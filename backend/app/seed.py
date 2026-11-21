@@ -7,6 +7,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine
+from .migrations import upgrade_schema
 from .models import (
     AvailabilityException,
     Brand,
@@ -78,7 +79,7 @@ def _calendar_for(brand_index: int, process_index: int) -> tuple[list[int], bool
 
 
 def seed_database() -> dict[str, int]:
-    Base.metadata.create_all(engine)
+    upgrade_schema(engine)
     with SessionLocal() as session:
         if session.scalar(select(Employee.id).limit(1)) is not None:
             # Remove fixed absence scenarios from old demo seeds; keep manager-entered records.
@@ -188,13 +189,13 @@ def seed_database() -> dict[str, int]:
         )
 
         # Contract defaults are configurable; the seed uses the documented five-day pattern.
-        for employee in employees:
+        for employee_index, employee in enumerate(employees):
             session.add(
                 EmployeeWorkContract(
                     employee=employee,
                     daily_capacity_hours=6.0,
                     max_days_per_week=5,
-                    max_hours_per_week=40.0,
+                    max_hours_per_week=45.0 if (employee_index, "CS") in employee_skill_pairs else 40.0,
                     minimum_days_off_per_week=2,
                 )
             )

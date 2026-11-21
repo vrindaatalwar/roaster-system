@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from .models import (
-    ApprovalStatus, AssignmentStatus, AvailabilityType, Brand, BrandPriority, BrandProcessRule,
+    AllocationSetting, ApprovalStatus, AssignmentStatus, AvailabilityType, Brand, BrandPriority, BrandProcessRule,
     BrandProcessSchedule,
     CoverageRequirement, Employee, EmployeeEligibility, EligibilityType,
     EmployeePodMembership, EmployeeRosterDayStatus, PodSchedule, PreferenceType, PublicHoliday, RosterAssignment,
@@ -358,7 +358,14 @@ def generate_month(session: Session, year: int, month: int, *,
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise RuntimeError(f"CP-SAT did not produce a usable roster (status={solver.status_name(status)}).")
 
-    run = RosterRun(year=year, month=month)
+    allocation_settings = session.get(AllocationSetting, 1)
+    run = RosterRun(year=year, month=month, allocation_snapshot={
+        "capacity_units": allocation_settings.capacity_units if allocation_settings else 12,
+        "min_chunk_units": allocation_settings.min_chunk_units if allocation_settings else 1,
+        "max_brands_per_day": allocation_settings.max_brands_per_day if allocation_settings else 2,
+        "hours_layer_enabled": bool(allocation_settings and allocation_settings.hours_layer_enabled),
+        "solver_status": "layer_1",
+    })
     session.add(run)
     session.flush()
     filled = 0
@@ -380,6 +387,7 @@ def generate_month(session: Session, year: int, month: int, *,
             session.add(RosterAssignment(
                 roster_run=run, employee=selected, brand_process=slot.rule,
                 assignment_date=slot.day, effort_hours=slot.rule.effort_hours_per_employee,
+                hours_units=int(round(slot.rule.effort_hours_per_employee * 2)),
                 status=AssignmentStatus.WORKING, explanation=reason,
             ))
         else:
@@ -388,6 +396,7 @@ def generate_month(session: Session, year: int, month: int, *,
             session.add(RosterAssignment(
                 roster_run=run, employee=None, brand_process=slot.rule,
                 assignment_date=slot.day, effort_hours=slot.rule.effort_hours_per_employee,
+                hours_units=0,
                 status=AssignmentStatus.UNCOVERED, explanation=reason,
             ))
 
@@ -439,6 +448,50 @@ def generate_month(session: Session, year: int, month: int, *,
         uncovered_slots=uncovered_count_value,
         explanation=explanation,
     ))
+    session.flush()
+    from .hours_allocation import apply_hours_layer
+    hours_result = {"status": "disabled", "solve_time_seconds": 0.0, "fallback": False}
+    layer_setting = session.get(AllocationSetting, 1)
+    if layer_setting is not None and layer_setting.hours_layer_enabled:
+        savepoint = session.begin_nested()
+        proposed = None
+        try:
+            proposed = apply_hours_layer(
+                session, run.id, preserve_from_run_id=preserve_from_run_id,
+                affected_dates=affected_dates,
+            )
+            if proposed is None or proposed.get("fallback"):
+                raise RuntimeError("Hours model did not return a usable solution")
+            from .validation import validate_roster
+            proposed_check = validate_roster(session, run.id)
+            proposed_hard = [issue for issue in proposed_check["issues"]
+                             if issue["severity"] == "error" and issue["code"] != "insufficient_coverage"]
+            if proposed_hard:
+                raise RuntimeError("Hours model failed independent validation")
+            savepoint.commit()
+            hours_result = proposed
+        except Exception as exc:
+            savepoint.rollback()
+            hours_result = {
+                "status": "fallback_layer_1", "solver_status": proposed.get("status") if proposed else "unknown",
+                "failure_stage": proposed.get("failure_stage") if proposed else None,
+                "solve_time_seconds": proposed.get("solve_time_seconds", 0.0) if proposed else 0.0,
+                "fallback": True, "fallback_reason": str(exc),
+            }
+            report = session.get(RosterGenerationReport, run.id)
+            if report:
+                report.hours_layer_status = "fallback_layer_1"
+                report.solve_time_seconds = hours_result["solve_time_seconds"]
+                report.explanation += " Hours layer failed; retained the valid Layer 1 roster."
+            run.allocation_snapshot = {
+                "capacity_units": layer_setting.capacity_units,
+                "min_chunk_units": layer_setting.min_chunk_units,
+                "max_brands_per_day": layer_setting.max_brands_per_day,
+                "hours_layer_enabled": True, "fallback": True,
+                "solver_status": hours_result["solver_status"],
+                "solve_time_seconds": hours_result["solve_time_seconds"],
+                "fallback_reason": str(exc),
+            }
     if commit:
         session.flush()
         # Do not persist a solver result that violates a hard rule. Uncovered
@@ -456,19 +509,21 @@ def generate_month(session: Session, year: int, month: int, *,
         session.commit()
     else:
         session.flush()
+    final_report = session.get(RosterGenerationReport, run.id)
     return {
         "roster_run_id": run.id,
         "year": year,
         "month": month,
-        "result_status": result_status,
-        "solver_status": solver.status_name(status),
-        "required_slots": len(slots),
-        "filled_slots": filled,
-        "uncovered_slots": uncovered_count_value,
-        "explanation": explanation,
+        "result_status": final_report.result_status if final_report else result_status,
+        "solver_status": final_report.solver_status if final_report else solver.status_name(status),
+        "required_slots": final_report.required_slots if final_report else len(slots),
+        "filled_slots": final_report.filled_slots if final_report else filled,
+        "uncovered_slots": final_report.uncovered_slots if final_report else uncovered_count_value,
+        "explanation": final_report.explanation if final_report else explanation,
         "warnings": pending_warnings,
         "replanned_from_run_id": preserve_from_run_id,
         "affected_dates": sorted(day.isoformat() for day in affected_dates) if affected_dates is not None else None,
+        "hours_layer": hours_result,
     }
 
 

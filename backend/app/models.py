@@ -159,11 +159,14 @@ class BrandPriority(Base):
     __tablename__ = "brand_priorities"
     __table_args__ = (
         CheckConstraint("priority BETWEEN 1 AND 5", name="ck_brand_priority_range"),
+        CheckConstraint("client_tier BETWEEN 1 AND 5", name="ck_brand_client_tier_range"),
     )
 
     brand_id: Mapped[int] = mapped_column(ForeignKey("brands.id", ondelete="CASCADE"), primary_key=True)
     priority: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
     deadline_note: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    client_tier: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    deadline_date: Mapped[date | None] = mapped_column(Date)
 
 
 class Skill(Base):
@@ -184,7 +187,7 @@ class EmployeeWorkContract(Base):
         UniqueConstraint("employee_id"),
         CheckConstraint("daily_capacity_hours > 0 AND daily_capacity_hours <= 8", name="ck_daily_capacity"),
         CheckConstraint("max_days_per_week BETWEEN 1 AND 5", name="ck_max_days_per_week"),
-        CheckConstraint("max_hours_per_week BETWEEN 1 AND 40", name="ck_max_hours_per_week"),
+        CheckConstraint("max_hours_per_week BETWEEN 1 AND 45", name="ck_max_hours_per_week"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -293,6 +296,7 @@ class BrandProcessRule(Base):
     __table_args__ = (
         UniqueConstraint("brand_id", "process_id"),
         CheckConstraint("effort_hours_per_employee > 0 AND effort_hours_per_employee <= 8", name="ck_brand_process_effort"),
+        CheckConstraint("demand_units IS NULL OR demand_units >= 0", name="ck_brand_process_demand_units"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -302,6 +306,7 @@ class BrandProcessRule(Base):
     operating_weekdays: Mapped[list[int]] = mapped_column(JSON, nullable=False)  # Monday=0 ... Sunday=6
     operate_on_public_holidays: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     effort_hours_per_employee: Mapped[float] = mapped_column(Float, nullable=False)
+    demand_units: Mapped[int | None] = mapped_column(Integer)
     can_share_same_day: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     continuous_presence: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     notes: Mapped[str] = mapped_column(Text, default="", nullable=False)
@@ -358,6 +363,7 @@ class RosterRun(Base):
         default=RosterStatus.DRAFT, nullable=False,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    allocation_snapshot: Mapped[dict | None] = mapped_column(JSON)
 
     assignments: Mapped[list["RosterAssignment"]] = relationship(back_populates="roster_run", cascade="all, delete-orphan")
     employee_days: Mapped[list["RosterEmployeeDay"]] = relationship(
@@ -380,6 +386,8 @@ class RosterGenerationReport(Base):
     filled_slots: Mapped[int] = mapped_column(Integer, nullable=False)
     uncovered_slots: Mapped[int] = mapped_column(Integer, nullable=False)
     explanation: Mapped[str] = mapped_column(Text, nullable=False)
+    hours_layer_status: Mapped[str] = mapped_column(String(30), default="disabled", nullable=False)
+    solve_time_seconds: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
 
     roster_run: Mapped[RosterRun] = relationship(back_populates="generation_report")
 
@@ -417,6 +425,7 @@ class RosterAssignment(Base):
     brand_process_rule_id: Mapped[int] = mapped_column(ForeignKey("brand_process_rules.id", ondelete="RESTRICT"), nullable=False)
     assignment_date: Mapped[date] = mapped_column(Date, nullable=False)
     effort_hours: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    hours_units: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     status: Mapped[AssignmentStatus] = mapped_column(
         Enum(AssignmentStatus, native_enum=False, values_callable=_enum_values),
         default=AssignmentStatus.WORKING, nullable=False,
@@ -426,3 +435,37 @@ class RosterAssignment(Base):
     roster_run: Mapped[RosterRun] = relationship(back_populates="assignments")
     employee: Mapped[Employee | None] = relationship()
     brand_process: Mapped[BrandProcessRule] = relationship()
+
+
+class AllocationSetting(Base):
+    """Singleton manager configuration for the optional hours allocator."""
+    __tablename__ = "allocation_settings"
+    __table_args__ = (
+        CheckConstraint("capacity_units BETWEEN 1 AND 16", name="ck_allocation_capacity_units"),
+        CheckConstraint("min_chunk_units BETWEEN 1 AND capacity_units", name="ck_allocation_min_chunk"),
+        CheckConstraint("max_brands_per_day BETWEEN 1 AND 15", name="ck_allocation_max_brands"),
+        CheckConstraint("solver_time_limit_seconds BETWEEN 1 AND 600", name="ck_allocation_time_limit"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    capacity_units: Mapped[int] = mapped_column(Integer, default=12, nullable=False)
+    min_chunk_units: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    max_brands_per_day: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    hours_layer_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    solver_time_limit_seconds: Mapped[int] = mapped_column(Integer, default=60, nullable=False)
+
+
+class PriorityOverride(Base):
+    __tablename__ = "priority_overrides"
+    __table_args__ = (
+        CheckConstraint("end_date >= start_date", name="ck_priority_override_dates"),
+        CheckConstraint("multiplier > 0", name="ck_priority_override_multiplier"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    brand_id: Mapped[int] = mapped_column(ForeignKey("brands.id", ondelete="CASCADE"), nullable=False)
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    multiplier: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    note: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    brand: Mapped[Brand] = relationship()

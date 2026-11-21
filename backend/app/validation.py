@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from .models import (
-    ApprovalStatus, AssignmentStatus, AvailabilityType, Brand, BrandProcessRule,
+    AllocationSetting, ApprovalStatus, AssignmentStatus, AvailabilityType, Brand, BrandProcessRule,
     BrandProcessSchedule, Employee, EmployeeEligibility, EmployeePodMembership,
     PodSchedule, PreferenceType, PublicHoliday,
     RosterAssignment, RosterRun,
@@ -50,6 +50,12 @@ def validate_roster(session: Session, roster_run_id: int) -> dict:
     )).all()
 
     issues: list[dict] = []
+    hours_snapshot = run.allocation_snapshot or {}
+    hours_layer_active = bool(hours_snapshot.get("hours_layer_enabled") and not hours_snapshot.get("fallback"))
+    settings = session.get(AllocationSetting, 1)
+    capacity_units = int(hours_snapshot.get("capacity_units", settings.capacity_units if settings else 12))
+    min_chunk_units = int(hours_snapshot.get("min_chunk_units", settings.min_chunk_units if settings else 1))
+    max_brands_per_day = int(hours_snapshot.get("max_brands_per_day", settings.max_brands_per_day if settings else 2))
 
     def add_issue(severity: str, code: str, message: str, *, day: date | None = None,
                   employee_id: int | None = None, rule_id: int | None = None,
@@ -166,10 +172,12 @@ def validate_roster(session: Session, roster_run_id: int) -> dict:
                     reason for reason in uncovered_reasons[(rule.id, day)] if reason
                 ))
                 reason_text = f" Reason: {' '.join(reasons)}" if reasons else ""
-                add_issue("error", "insufficient_coverage",
+                add_issue("gap", "insufficient_coverage",
                           f"{rule.brand.code} {rule.process.code} has {actual} assigned of {required} required."
                           f"{reason_text}",
                           day=day, rule_id=rule.id, required=required, assigned=actual)
+                issues[-1]["units_short"] = max(0, required - actual) * capacity_units
+                issues[-1]["gap_reason"] = reasons[0] if reasons else "No qualified available employee could cover the required staffing floor."
             maximum = maximum_by_weekday.get(day.weekday())
             if maximum is not None and actual > maximum:
                 add_issue("error", "maximum_staff_exceeded",
@@ -201,6 +209,26 @@ def validate_roster(session: Session, roster_run_id: int) -> dict:
             add_issue("error", "daily_capacity_exceeded",
                       f"Employee has {hours:g} assigned hours, above daily capacity of {capacity:g}.",
                       day=day, employee_id=employee_id)
+        if hours_layer_active:
+            units = sum(row.hours_units if row.hours_units else int(round(row.effort_hours * 2)) for row in rows)
+            unit_limit = min(capacity_units, int(round((employee.work_contract.daily_capacity_hours
+                                                        if employee.work_contract else 8.0) * 2)))
+            if units > unit_limit:
+                add_issue("error", "daily_capacity_units_exceeded",
+                          f"Employee has {units} half-hour units, above the configured daily limit of {unit_limit}.",
+                          day=day, employee_id=employee_id)
+            brand_count = len({rule_by_id[row.brand_process_rule_id].brand_id for row in rows
+                               if row.brand_process_rule_id in rule_by_id})
+            if brand_count > max_brands_per_day:
+                add_issue("error", "maximum_brands_per_day_exceeded",
+                          f"Employee is assigned across {brand_count} brands, above the configured limit of {max_brands_per_day}.",
+                          day=day, employee_id=employee_id)
+            for row in rows:
+                row_units = row.hours_units if row.hours_units else int(round(row.effort_hours * 2))
+                if row_units < min_chunk_units:
+                    add_issue("error", "assignment_below_minimum_chunk",
+                              f"Assignment has {row_units} half-hour units, below the minimum chunk of {min_chunk_units}.",
+                              day=day, employee_id=employee_id, rule_id=row.brand_process_rule_id)
 
         hours_by_pod: dict[int, float] = defaultdict(float)
         rows_by_pod: dict[int, list[RosterAssignment]] = defaultdict(list)
@@ -240,6 +268,38 @@ def validate_roster(session: Session, roster_run_id: int) -> dict:
                       f"Employee is assigned on {days} days in ISO week {year}-W{week:02d}, above the {contract.max_days_per_week}-day limit.",
                       employee_id=employee_id)
 
+    if hours_layer_active:
+        served_units: dict[tuple[int, date], int] = defaultdict(int)
+        for (rule_id, day), rows in assigned_by_rule_day.items():
+            served_units[(rule_id, day)] = sum(
+                row.hours_units if row.hours_units else int(round(row.effort_hours * 2)) for row in rows
+            )
+        for rule in rules:
+            by_weekday = {item.weekday: item.minimum_staff for item in rule.coverage_requirements}
+            for day_number in range(1, last_day + 1):
+                day = date(run.year, run.month, day_number)
+                minimum = by_weekday.get(day.weekday(), 0)
+                if day.weekday() not in rule.operating_weekdays or not (
+                    minimum or (rule.demand_units is not None and rule.demand_units > 0)
+                ):
+                    continue
+                if day in holidays and not rule.operate_on_public_holidays:
+                    continue
+                demand = rule.demand_units if rule.demand_units is not None else minimum * capacity_units
+                served = served_units[(rule.id, day)]
+                floor_units = min(demand, minimum * capacity_units)
+                actual_staff = len(assigned_by_rule_day[(rule.id, day)])
+                if served < floor_units and actual_staff >= minimum:
+                    add_issue("gap", "floor_hours_short",
+                              f"{rule.brand.code} {rule.process.code} served {served} of {floor_units} guaranteed floor units.",
+                              day=day, rule_id=rule.id, required=floor_units, assigned=served)
+                    issues[-1]["units_short"] = floor_units - served
+                    issues[-1]["gap_reason"] = "Available employee capacity could not satisfy the guaranteed process-hours floor."
+                if served > demand:
+                    add_issue("error", "process_demand_exceeded",
+                              f"{rule.brand.code} {rule.process.code} serves {served} units above its {demand}-unit demand.",
+                              day=day, rule_id=rule.id, required=demand, assigned=served)
+
     for employee in employees:
         for exception in employee.availability_exceptions:
             if (exception.approval_status == ApprovalStatus.PENDING
@@ -263,6 +323,8 @@ def validate_roster(session: Session, roster_run_id: int) -> dict:
     counts = Counter(issue["severity"] for issue in issues)
     if counts["error"]:
         status = "needs_attention"
+    elif counts["gap"]:
+        status = "needs_attention"
     elif counts["warning"]:
         status = "valid_with_warnings"
     else:
@@ -275,5 +337,7 @@ def validate_roster(session: Session, roster_run_id: int) -> dict:
         "issue_count": len(issues),
         "error_count": counts["error"],
         "warning_count": counts["warning"],
+        "gap_count": counts["gap"],
+        "hard_violation_count": counts["error"],
         "issues": issues,
     }
