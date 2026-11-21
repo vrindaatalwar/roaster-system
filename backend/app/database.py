@@ -16,6 +16,13 @@ DATABASE_URL = os.getenv(
     f"postgresql+psycopg://{os.getenv('USER', 'postgres')}@localhost:5432/datastraw_roster",
 )
 
+# Railway provides PostgreSQL URLs without a SQLAlchemy driver suffix. This
+# project installs psycopg 3, so select that driver explicitly for those URLs.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
