@@ -87,6 +87,14 @@ async def enforce_demo_role_access(request: Request, call_next):
             "detail": "Select a demo role using the X-App-Role header.",
         })
 
+    # All current write operations are manager workflows. Keep this check in
+    # middleware so new mutation endpoints cannot accidentally omit the role
+    # guard. Demo roles remain user-selectable and are not real authentication.
+    if role != "manager" and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        return JSONResponse(status_code=403, content={
+            "detail": "Only the manager demo role can change roster data.",
+        })
+
     request.state.actor_role = role
     request.state.actor_employee_id = None
     request.state.actor_employee_code = None
