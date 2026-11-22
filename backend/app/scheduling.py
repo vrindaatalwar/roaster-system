@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import calendar
+import logging
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
@@ -18,6 +20,9 @@ from .models import (
 )
 
 HOUR_SCALE = 4  # quarter-hour integer units for CP-SAT
+ROSTER_SOLVER_TIME_LIMIT_SECONDS = 12.0
+ROSTER_SOLVER_WORKERS = 2
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -53,6 +58,7 @@ def generate_month(session: Session, year: int, month: int, *,
                    affected_dates: set[date] | None = None,
                    forced_assignments: list[tuple[date, int, int]] | None = None,
                    commit: bool = True) -> dict:
+    generation_started = time.monotonic()
     current_year = date.today().year
     if not isinstance(year, int) or isinstance(year, bool) or not current_year <= year <= current_year + 5:
         raise ValueError(f"Year must be an integer between {current_year} and {current_year + 5}.")
@@ -284,15 +290,20 @@ def generate_month(session: Session, year: int, month: int, *,
         for assignment_var, _ in entries:
             model.add(assignment_var <= shift_use)
         model.add(shift_use <= sum(variable for variable, _ in entries))
-    shift_keys = list(shift_use_vars)
-    for index, first_key in enumerate(shift_keys):
-        employee_id, day, first_pod_id = first_key
-        first_schedule = schedule_by_pod.get(first_pod_id)
-        for second_key in shift_keys[index + 1:]:
-            second_employee_id, second_day, second_pod_id = second_key
-            if (employee_id == second_employee_id and day == second_day and first_pod_id != second_pod_id
-                    and _windows_overlap(first_schedule, schedule_by_pod.get(second_pod_id))):
-                model.add(shift_use_vars[first_key] + shift_use_vars[second_key] <= 1)
+    # Compare only pod windows for the same employee and date. Scanning every
+    # pair of shift variables grows quadratically with the whole month's model.
+    shift_keys_by_employee_day: dict[tuple[int, date], list[tuple[int, int, int]]] = defaultdict(list)
+    for key in shift_use_vars:
+        employee_id, day, _ = key
+        shift_keys_by_employee_day[(employee_id, day)].append(key)
+    for keys in shift_keys_by_employee_day.values():
+        for index, first_key in enumerate(keys):
+            first_schedule = schedule_by_pod.get(first_key[2])
+            for second_key in keys[index + 1:]:
+                if first_key[2] != second_key[2] and _windows_overlap(
+                    first_schedule, schedule_by_pod.get(second_key[2])
+                ):
+                    model.add(shift_use_vars[first_key] + shift_use_vars[second_key] <= 1)
 
     max_sundays = model.new_int_var(0, len(month_dates), "maximum_sunday_assignments")
     max_holidays = model.new_int_var(0, len(month_dates), "maximum_holiday_assignments")
@@ -351,10 +362,12 @@ def generate_month(session: Session, year: int, month: int, *,
                    + sum(preference_score_terms))
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 60.0
-    solver.parameters.num_search_workers = 8
+    solver.parameters.max_time_in_seconds = ROSTER_SOLVER_TIME_LIMIT_SECONDS
+    solver.parameters.num_search_workers = ROSTER_SOLVER_WORKERS
     solver.parameters.random_seed = 0
+    model_built_at = time.monotonic()
     status = solver.solve(model)
+    solve_finished_at = time.monotonic()
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise RuntimeError(f"CP-SAT did not produce a usable roster (status={solver.status_name(status)}).")
 
@@ -510,6 +523,13 @@ def generate_month(session: Session, year: int, month: int, *,
     else:
         session.flush()
     final_report = session.get(RosterGenerationReport, run.id)
+    logger.info(
+        "Roster generation completed year=%s month=%s required=%s filled=%s solver_status=%s "
+        "model_build_seconds=%.3f solve_seconds=%.3f total_seconds=%.3f",
+        year, month, len(slots), filled, solver.status_name(status),
+        model_built_at - generation_started, solve_finished_at - model_built_at,
+        time.monotonic() - generation_started,
+    )
     return {
         "roster_run_id": run.id,
         "year": year,
