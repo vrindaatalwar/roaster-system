@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   IconArrowBackUp,
   IconArrowForwardUp,
@@ -18,6 +18,7 @@ const API = import.meta.env.VITE_API_BASE_URL ?? "";
 const weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const today = new Date();
 const todayDate = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+const selectedRosterStorageKey = "datastraw-selected-roster-id";
 
 type Page = "roster" | "daily_assignments" | "employee_calendar" | "employees" | "pods" | "brands";
 type Role = "manager" | "pod_lead" | "employee";
@@ -234,6 +235,7 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const rosterLoadSequence = useRef(0);
 
   useEffect(() => {
     const onHashChange = () => setPage(pageFromHash());
@@ -305,8 +307,14 @@ function App() {
       request<SavedRoster[]>("/api/v1/rosters")
         .then(async (runs) => {
           setSavedRosters(runs);
-          const selectedMonthRun = runs.find((run) => run.year === today.getFullYear() && run.month === today.getMonth() + 1);
-          if (selectedMonthRun) await loadRoster(selectedMonthRun.roster_run_id);
+          const storedId = Number(localStorage.getItem(selectedRosterStorageKey));
+          const selectedRun = runs.find((run) => run.roster_run_id === storedId) ?? runs[0];
+          if (selectedRun) await loadRoster(selectedRun.roster_run_id);
+          else {
+            setRoster(null);
+            setValidation(null);
+            localStorage.removeItem(selectedRosterStorageKey);
+          }
         })
         .catch((reason: Error) => setError(reason.message));
     }).catch((reason: Error) => setError(reason.message));
@@ -427,15 +435,21 @@ function App() {
   }
 
   async function loadRoster(id: number): Promise<Roster> {
+    const sequence = ++rosterLoadSequence.current;
     const [data, checks] = await Promise.all([
       request<Roster>(`/api/v1/rosters/${id}`),
       request<Validation>(`/api/v1/rosters/${id}/validation`),
     ]);
-    setRoster(data);
-    setValidation(checks);
-    setBrandFilter("all");
-    setProcessFilter("all");
-    setDateFilter("");
+    if (sequence === rosterLoadSequence.current) {
+      setRoster(data);
+      setValidation(checks);
+      setYear(data.year);
+      setMonth(data.month);
+      localStorage.setItem(selectedRosterStorageKey, String(data.roster_run_id));
+      setBrandFilter("all");
+      setProcessFilter("all");
+      setDateFilter("");
+    }
     return data;
   }
 
@@ -467,6 +481,7 @@ function App() {
     if (targetRunId === null) {
       setRoster(null);
       setValidation(null);
+      localStorage.removeItem(selectedRosterStorageKey);
       return;
     }
     await loadRoster(targetRunId);
@@ -997,8 +1012,18 @@ function App() {
     </aside>
     <div className={cn("min-w-0")}>
     <main className={cn("mx-auto w-full min-w-0 max-w-[1600px] overflow-x-hidden px-[34px] pb-14 pt-[30px] max-[760px]:px-[18px] max-[760px]:pb-9 max-[760px]:pt-[22px]")}>
-    <section className={cn("flex justify-between items-end [&_h1]:m-0 [&_h1]:text-[32px] [&_h1]:font-semibold [&_h1]:leading-[1.12] [&_h1]:tracking-[-0.8px] [&_h1]:text-[#1d1d1f] [&_h1]:max-[760px]:text-[29px] [&_p]:mt-[7px] [&_p]:text-[13px] [&_p]:leading-[1.35] [&_p]:text-[#6e6e73] mb-0 min-h-[93px] items-center pb-[25px] max-[760px]:min-h-0 max-[760px]:flex-col max-[760px]:items-start max-[760px]:gap-3 max-[760px]:pb-5")}>
+    <section className={cn("flex justify-between items-end gap-4 [&_h1]:m-0 [&_h1]:text-[32px] [&_h1]:font-semibold [&_h1]:leading-[1.12] [&_h1]:tracking-[-0.8px] [&_h1]:text-[#1d1d1f] [&_h1]:max-[760px]:text-[29px] [&_p]:mt-[7px] [&_p]:text-[13px] [&_p]:leading-[1.35] [&_p]:text-[#6e6e73] mb-0 min-h-[93px] items-center pb-[25px] max-[760px]:min-h-0 max-[760px]:flex-col max-[760px]:items-start max-[760px]:gap-3 max-[760px]:pb-5")}>
       <div><h1>{pageInfo[page].title}</h1><p>{pageInfo[page].description}</p></div>
+      {savedRosters.length > 0 && <label className={cn("flex min-w-[220px] flex-col gap-1.5 text-xs font-medium text-[#424245] max-[760px]:w-full")}>
+        Viewing roster
+        <select aria-label="Viewing roster" value={roster?.roster_run_id ?? ""} disabled={busy}
+          onChange={(event) => { const id = Number(event.target.value); if (id) void runAction(async () => { await loadRoster(id); }); }}
+          className={cn("h-10 rounded-lg border border-[#d2d2d7] bg-white px-3 text-[13px] text-[#003459] outline-none focus-visible:ring-2 focus-visible:ring-[#7d8cc4]/30 disabled:opacity-60")}>
+          {savedRosters.map((item) => <option key={item.roster_run_id} value={item.roster_run_id}>
+            {new Date(item.year, item.month - 1, 1).toLocaleString("en", { month: "long", year: "numeric" })} · #{item.roster_run_id}
+          </option>)}
+        </select>
+      </label>}
     </section>
 
     {error && <div className={cn("mb-3 flex items-center gap-3 rounded-lg border p-3 text-xs [&_button]:ml-auto [&_button]:border-0 [&_button]:bg-transparent [&_button]:text-lg [&_button]:text-current border-[#f3d7d0] bg-[#fff0ec] text-[#9f5445] [&_strong]:font-semibold")}><strong>Couldn’t complete that action</strong><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss">×</button></div>}
