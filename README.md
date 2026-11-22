@@ -1,7 +1,5 @@
 # DataStraw Smart Roster
 
-Stages 1–3 provide the configurable workforce foundation, CP-SAT monthly allocation, independent validation, and manager-approved targeted replanning. Stage 4 provides manager-managed team and work configuration, company/pod/brand/process/employee roster perspectives, daily coverage counts, and validated assignment editing. The approved Stage 6 extension adds two configurable pod work windows, cross-pod memberships, window-aware assignment candidates, and deadline priority as a scheduling tie-breaker.
-
 ## Stack
 
 - React with TypeScript
@@ -73,16 +71,39 @@ No employee/date-specific absence scenario is seeded. The manager chooses the em
 
 All seeded names, brands, holidays, rules, priorities, and availability examples are fictional. Demo assumptions include two configurable pod windows, each spanning eight clock hours with a one-hour lunch and up to six allocatable work hours per employee, plus a five-day weekly contract capped at 40 hours for non-CS employees and 45 hours for CS-skilled employees. The separate six-hour daily cap means the effective weekly allocatable ceiling remains 30 hours until daily capacity or maximum workdays are raised. These are not verified company policies. A clean database seed includes varied coverage calendars, shared ownership, cross-pod backups, deadline priorities, and one deliberate no-backup case. Seeding does not reset or overwrite an existing database; an existing installation keeps its saved configuration and rosters. Existing databases need manager configuration of pod windows, process-to-pod mappings, and cross-pod memberships to use the new behavior. Back up manager data before creating a fresh demo database to use the revised sample defaults. Pod windows filter candidates and prevent overlapping-window assignments; exact task start/end times, continuous intraday coverage, inter-shift rest, and work outside the selected month for weekly limits are not modeled. These are demo limitations, not claims of legal compliance.
 
-## Assessment approach
+## Assessment questions and answers
 
-1. **Data model:** Employees have a primary pod and configurable memberships, role, skills, work contract, weekly offs, preferences, and availability records. Brand/process rules hold calendars, effort, same-day sharing, minimum/maximum staffing, a pod work window, and brand deadline priority. Eligibility remains a separate primary/backup relationship; pod membership does not grant eligibility. Roster runs own dated assignments and employee-day statuses.
-2. **Generation and validation:** OR-Tools CP-SAT selects employees for each configured brand/process/date slot. Hard rules cover active status, required skill and eligibility, pod membership, approved unavailability, weekly offs, daily and weekly effort, work-day limits, and overlapping pod-window conflicts. The independent validator checks persisted assignments against current inputs and returns coverage gaps and rule conflicts. Total feasible coverage is maximized first; when solutions tie on coverage, manager-set higher deadline priority is preferred.
-3. **Single- and multi-resource brands:** Most sample brands have one primary owner, with separately qualified backups covering weekly offs and absences. Other sample brands show separate process owners and multiple employees sharing the same process. Multiple people count toward same-day coverage only when that process permits sharing.
-4. **Unavailable sole owner:** The manager records and approves an absence. The validator identifies affected slots, the candidate list reports qualified employees who still have capacity, and the manager reviews a proposed replan. If no replacement is feasible, the slot stays uncovered with an explanation.
-5. **Conflicts and insufficient staffing:** The solver maximizes filled coverage without violating hard constraints. It can return a partial draft with uncovered slots and concrete blockers. Preferences are soft goals. The UI labels the result as a draft and shows validation before a manager decides what to change.
-6. **Automation and human control:** Allocation, constraint checks, candidate screening, and proposed replanning are automated. A manager controls availability status, configuration, deadline priority, manual assignment changes, and whether to apply a proposed roster. The manual picker uses the same hard candidate rules as generation.
-7. **Doubling the team and brands:** Keep the relational model and solver constraints, then add database migrations, API pagination, trusted authentication and role-to-identity binding, solver-performance monitoring, and load tests. The current role views are an unauthenticated development preview, not production security. If solve time grows, benchmark the model and consider decomposing by independent coverage groups while preserving global employee capacity constraints.
-8. **One more week:** Add exact task-time blocks and rest constraints if the business needs intraday coverage validation, then run the expanded model against real historical demand and employee contracts. Replace fictional data with approved operational inputs before production use.
+### 1. How did you model employees, brands, processes, pods, and their relationships?
+
+Employees have a primary pod and can belong to additional pods. Their records include role, skills, work contract, weekly offs, preferences, and dated availability. A brand can have multiple processes, and each brand/process rule defines its coverage calendar, staffing or effort needs, sharing policy, and pod work window. Employee eligibility is recorded separately for each brand/process as a primary or backup assignment; pod membership or a skill alone does not grant eligibility. Roster runs store dated assignments and employee-day statuses.
+
+### 2. How does your system generate a roster and determine whether it satisfies the required constraints?
+
+For a requested month, OR-Tools CP-SAT selects eligible employees for configured brand/process/date requirements. It enforces hard rules for active status, skills and eligibility, pod membership, approved unavailability, weekly offs, daily and weekly capacity, workday limits, staffing bounds, sharing rules, and conflicting pod windows. An independent validator checks the saved roster. Hard-rule violations reject the proposed roster; coverage gaps can remain in a draft with explanations. When feasible solutions cover the same number of slots, deadline priority can break the tie.
+
+### 3. How did you handle the difference between single-resource brands and brands with multiple employees?
+
+A process requiring one person is assigned to one eligible employee per day. Where sharing is allowed, multiple eligible employees can cover the process within its configured staffing bounds. Primary and backup eligibility are explicit, and capacity is shared across all brands and pods so an employee is not over-allocated.
+
+### 4. What happens when an employee manages all processes for a brand but is unavailable on a required working day?
+
+The manager records and approves the absence. The system identifies affected dates, screens eligible backup employees against capacity and other hard rules, and can prepare a targeted replan. The manager reviews and applies the proposal, leaving the current roster in place until then. If no replacement is feasible, the slot remains uncovered in the draft with an explanation.
+
+### 5. How does your system handle conflicting requirements or insufficient staffing?
+
+The solver maximizes feasible coverage without breaking hard constraints. If qualified capacity is insufficient, it returns a partial draft with uncovered slots and blockers. Preferences are treated as soft goals. Independent validation reports conflicts, and publishing is blocked by hard-rule violations or unresolved gaps unless a manager explicitly confirms the gaps.
+
+### 6. Which parts of the process did you automate, and which did you leave under human control? Why?
+
+The system automates candidate screening, roster allocation, constraint validation, gap reporting, and proposed replanning. Managers configure employees and brand/process rules, record or approve availability, set priority overrides, edit drafts, review replans, and choose whether to apply or publish them. This keeps repetitive allocation and checks consistent while leaving decisions with operational impact under manager review. Manual assignment uses the same hard-rule checks as generated assignments.
+
+### 7. If the company doubled its team and brand count, what would you change about your solution?
+
+I would first add trusted authentication with roles tied to verified identities, database migrations, API pagination, and monitoring for solver time, outcomes, and service errors. I would benchmark larger workloads and add load tests. If solve time became a bottleneck, I would explore splitting independent coverage groups while preserving shared employee capacity and cross-pod constraints. The current role selector is a development preview, not production access control.
+
+### 8. If you had one additional week to work on this, what would you improve first?
+
+I would reduce manual coordination by prototyping a manager assistant for leave requests. It would explain roster impact, identify qualified backups, and prepare a recommendation or replan for manager review, without approving leave or changing assignments automatically. I would also add clearer priority guidance because current priorities use demo data. For employees and pod leads, I would improve the calendar with assigned work and meetings, then explore calendar integration and assignment notifications, including Slack. These additions would need role-appropriate access to real employee and calendar data.
 
 ## Tests and guardrails
 
@@ -98,18 +119,3 @@ Layer 1 uses two CP-SAT workers and a 12-second solve limit so roster generation
 
 After adding the hours layer, an isolated SQLite run of the complete 30-employee seed for November 2026 completed generation in 23.344 seconds with Layer 2 enabled. The hours model was optimal in 0.889 seconds across 2,280 assignment/hour variables; it preserved 417 of 421 minimum staffing slots, with four allowed coverage gaps. This is a local smoke benchmark, not a production performance guarantee.
 
-## Demo walkthrough (3–5 minutes)
-
-1. Generate a monthly roster and show the company view, employee-day statuses, and a brand-specific calendar.
-2. Filter the roster by pod, brand, process, and employee; open an assignment reason and edit a draft assignment to show immediate validation.
-3. Open a brand/process rule and change a coverage day or minimum; review the affected dates and before/after allocation proposal.
-4. Record or approve an absence for one of three eligible employees, inspect ranked backup options, and apply the targeted replan.
-5. Show the deliberate sole-owner/no-backup case and its uncovered-slot explanation.
-
-## Deployment and submission checklist
-
-The source is prepared for a container deployment. The assessment additionally requires a public application URL, public GitHub repository, demo video, approach note, accessible LinkedIn link, and a submission email with a specific subject. Those items require the submitter's hosting account, repository visibility, video, and personal profile link; do not use fictional links or claim a deployment that has not been published.
-
-## Project stages
-
-Work is gated by the stages in `requirement.txt`. Stages 1–4 cover the data foundation, allocation, independent validation, manager configuration, roster perspectives, and validated manual draft edits. Stage 5 covers assessment change workflow and submission readiness; Stage 6 is the approved time-window, cross-pod, and deadline-priority extension. Stage 7+ contains optional work. Public hosting, repository visibility, demo recording, and the submitter's own profile link still require the submitter's accounts and input.
